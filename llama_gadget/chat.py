@@ -9,6 +9,7 @@ from .service import BASE_URL
 
 class ChatWorker(QThread):
     token = pyqtSignal(str)
+    stats = pyqtSignal(dict)  # usage + timings from the final chunk
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
 
@@ -25,6 +26,7 @@ class ChatWorker(QThread):
         body = json.dumps({
             "messages": self.messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "temperature": 0.7,
             # Qwen3: skip the long thinking phase for a snappy chat utility
             "chat_template_kwargs": {"enable_thinking": False},
@@ -42,9 +44,13 @@ class ChatWorker(QThread):
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    delta = json.loads(data)["choices"][0]["delta"].get("content")
-                    if delta:
-                        self.token.emit(delta)
+                    obj = json.loads(data)
+                    if obj.get("usage"):
+                        self.stats.emit({**obj["usage"], **obj.get("timings", {})})
+                    if obj.get("choices"):
+                        delta = obj["choices"][0]["delta"].get("content")
+                        if delta:
+                            self.token.emit(delta)
             self.finished_ok.emit()
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))

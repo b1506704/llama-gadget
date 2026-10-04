@@ -1,6 +1,7 @@
 """Llama Gadget - tiny desktop chat + service toggle for the always-on text LLM."""
 import sys
 import threading
+import time
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap, QTextCursor
@@ -39,6 +40,8 @@ def make_icon(color: str) -> QIcon:
 
 class Bridge(QObject):
     status = pyqtSignal(str)
+    gpus = pyqtSignal(list)
+    ctx = pyqtSignal(object)
 
 
 class InputBox(QTextEdit):
@@ -59,17 +62,22 @@ class Gadget(QWidget):
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.worker = None
         self.state = "offline"
+        self.n_ctx = 0
+        self.ctx_used = 0
+        self.last_speed = ""
         self._drag = None
         self._busy_toggle = False
 
         self.setWindowTitle("Llama Gadget")
         self.setWindowFlag(Qt.WindowType.Tool, False)
-        self.resize(380, 520)
+        self.resize(400, 580)
         self._build_ui()
         self.setStyleSheet(STYLE)
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
+        self.bridge.gpus.connect(self._set_gpus)
+        self.bridge.ctx.connect(lambda n: setattr(self, "n_ctx", n or self.n_ctx))
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
         self._poll()
@@ -123,6 +131,14 @@ class Gadget(QWidget):
         self.view.setOpenExternalLinks(True)
         lay.addWidget(self.view, 1)
 
+        self.stats_lbl = QLabel("Context: – · Speed: –")
+        self.gpu_lbl = QLabel("GPU: …")
+        for l in (self.stats_lbl, self.gpu_lbl):
+            l.setStyleSheet("color:#8b949e; font-size:11px;")
+        lay.addWidget(self.stats_lbl)
+        lay.addWidget(self.gpu_lbl)
+        self._update_stats()
+
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter to send, Shift+Enter for newline)")
         self.input.setFixedHeight(64)
@@ -175,7 +191,18 @@ class Gadget(QWidget):
 
     # ---- service ----
     def _poll(self):
-        threading.Thread(target=lambda: self.bridge.status.emit(service.status()), daemon=True).start()
+        def job():
+            self.bridge.status.emit(service.status())
+            self.bridge.gpus.emit(service.gpu_stats())
+            if not self.n_ctx:
+                self.bridge.ctx.emit(service.n_ctx())
+        threading.Thread(target=job, daemon=True).start()
+
+    def _set_gpus(self, gpus):
+        # The service runs on the second GPU; show all so activity on either is visible.
+        self.gpu_lbl.setText("\n".join(
+            f"GPU{g['index']} {g['name']}: {g['util']}% · {g['used']}/{g['total']} MiB · {g['temp']}°C"
+            for g in gpus) or "GPU: n/a")
 
     def _set_status(self, s):
         self.state = s
@@ -202,6 +229,21 @@ class Gadget(QWidget):
             self.bridge.status.emit(service.status())
         threading.Thread(target=job, daemon=True).start()
 
+    def _update_stats(self):
+        turns = sum(1 for m in self.history if m["role"] == "user")
+        ctx = f"{self.ctx_used}/{self.n_ctx}" if self.n_ctx else str(self.ctx_used)
+        pct = f" ({100 * self.ctx_used // self.n_ctx}%)" if self.n_ctx else ""
+        self.stats_lbl.setText(f"Context: {ctx} tok{pct} · Turns: {turns}"
+                               + (f"\n{self.last_speed}" if self.last_speed else ""))
+
+    def _on_stats(self, st):
+        self.ctx_used = st.get("total_tokens", self.ctx_used)
+        if "predicted_per_second" in st:
+            self.last_speed = (f"Gen: {st['predicted_per_second']:.1f} tok/s · "
+                               f"Prompt: {st.get('prompt_per_second', 0):.0f} tok/s · "
+                               f"Out: {st.get('completion_tokens', 0)} tok")
+        self._update_stats()
+
     def _update_controls(self):
         ready = self.state == "online" and self.worker is None
         self.send_btn.setEnabled(ready)
@@ -224,8 +266,10 @@ class Gadget(QWidget):
         self.view.append("")
         self.view.insertHtml('<b style="color:#3fb950">Assistant</b><br>')
         self.reply = ""
+        self._ntok = 0
         self.worker = ChatWorker(list(self.history), parent=self)
         self.worker.token.connect(self._on_token)
+        self.worker.stats.connect(self._on_stats)
         self.worker.finished_ok.connect(self._on_done)
         self.worker.failed.connect(self._on_fail)
         self.worker.start()
@@ -233,6 +277,12 @@ class Gadget(QWidget):
 
     def _on_token(self, t):
         self.reply += t
+        self._ntok = getattr(self, "_ntok", 0) + 1
+        if self._ntok == 1:
+            self._t0 = time.monotonic()
+        elif self._ntok % 5 == 0:
+            self.last_speed = f"Gen: {(self._ntok - 1) / max(time.monotonic() - self._t0, 1e-6):.1f} tok/s (live)"
+            self._update_stats()
         self.view.moveCursor(QTextCursor.MoveOperation.End)
         self.view.insertPlainText(t)
         self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
@@ -247,6 +297,7 @@ class Gadget(QWidget):
         self._finish()
 
     def _on_fail(self, err):
+        self._update_stats()
         self.view.append(f'<span style="color:#f85149">Error: {err}</span>')
         self.history.pop()  # drop the unanswered user turn
         self._finish()
@@ -257,6 +308,9 @@ class Gadget(QWidget):
             self.worker.wait(2000)
             self.worker = None
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.ctx_used = 0
+        self.last_speed = ""
+        self._update_stats()
         self.view.clear()
         self._update_controls()
 

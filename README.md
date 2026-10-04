@@ -4,6 +4,7 @@ Small PyQt6 desktop utility for CachyOS: toggle the always-on `llama-services` s
 (Qwen3-8B on the second GPU, `127.0.0.1:8080`) and chat with it.
 
 - Service on/off button + tray icon (green = online, amber = loading, red = offline)
+- Live stats: context used/window, turns, tok/s (generation + prompt), per-GPU util/VRAM/temp
 - Streaming chat, **New session** to reset the conversation
 - **Gadget mode**: frameless, always-on-top, drag to move (Wayland compositors may ignore on-top/move; use your WM's rules)
 - Closing the window hides it to the tray

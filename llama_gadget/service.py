@@ -40,3 +40,30 @@ def start():
 
 def stop():
     return _systemctl("stop", UNIT, timeout=60)
+
+
+def n_ctx(base_url=BASE_URL):
+    """Server context window size, or None."""
+    import json
+    try:
+        with urllib.request.urlopen(base_url + "/props", timeout=2) as r:
+            return json.load(r)["default_generation_settings"]["n_ctx"]
+    except Exception:
+        return None
+
+
+def gpu_stats():
+    """List of dicts (index, name, util %, mem_used MiB, mem_total MiB, temp C) via nvidia-smi."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return []
+    gpus = []
+    for line in out.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) == 6:
+            gpus.append(dict(index=int(f[0]), name=f[1].replace("NVIDIA GeForce ", ""), util=int(f[2]),
+                             used=int(f[3]), total=int(f[4]), temp=int(f[5])))
+    return gpus
