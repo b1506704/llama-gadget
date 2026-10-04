@@ -312,11 +312,27 @@ class Gadget(QWidget):
         self.view.setOpenExternalLinks(True)
         lay.addWidget(self.view, 1)
 
+        vbar = self.view.verticalScrollBar()
+        vbar.valueChanged.connect(self._on_scroll)
+        vbar.sliderReleased.connect(self._schedule_render)
+
+        srow = QHBoxLayout()
         self.stats_lbl = QLabel()
+        self.stats_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.scroll_bottom_btn = QPushButton("↓ Bottom")
+        self.scroll_bottom_btn.setStyleSheet(
+            "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
+            "padding: 2px 8px; font-size: 11px;")
+        self.scroll_bottom_btn.setToolTip("Jump to latest messages")
+        self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
+        self.scroll_bottom_btn.hide()
+        srow.addWidget(self.stats_lbl, 1)
+        srow.addWidget(self.scroll_bottom_btn)
+        lay.addLayout(srow)
+
         self.gpu_lbl = QLabel("GPU: …")
-        for l in (self.stats_lbl, self.gpu_lbl):
-            l.setStyleSheet("color:#8b949e; font-size:11px;")
-            lay.addWidget(l)
+        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = QLabel()
         self.attach_lbl.setWordWrap(True)
@@ -598,7 +614,15 @@ class Gadget(QWidget):
     # ---------------------------------------------------------------- markdown rendering
     def _render(self):
         bar = self.view.verticalScrollBar()
-        stick = bar.value() >= bar.maximum() - 24
+        if bar.isSliderDown():
+            # User is actively dragging the scrollbar slider; defer render so drag isn't interrupted
+            self._render_pending = True
+            return
+
+        prev_val = bar.value()
+        prev_max = bar.maximum()
+        stick = (prev_val >= prev_max - 48) if prev_max > 0 else True
+
         parts = []
         for m in self.msgs:
             parts.append(self._md_context(m) if m["role"] == "context" else
@@ -610,8 +634,27 @@ class Gadget(QWidget):
         if not parts:
             parts.append("_Start chatting — responses render as Markdown._")
         self.view.setMarkdown("\n\n---\n\n".join(parts))
+
         if stick:
             bar.setValue(bar.maximum())
+            if hasattr(self, "scroll_bottom_btn"):
+                self.scroll_bottom_btn.hide()
+        else:
+            bar.setValue(min(prev_val, bar.maximum()))
+            if hasattr(self, "scroll_bottom_btn") and bar.maximum() > 60:
+                self.scroll_bottom_btn.show()
+
+    def _scroll_to_bottom(self):
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        if hasattr(self, "scroll_bottom_btn"):
+            self.scroll_bottom_btn.hide()
+
+    def _on_scroll(self, val):
+        bar = self.view.verticalScrollBar()
+        at_bottom = (val >= bar.maximum() - 48) if bar.maximum() > 0 else True
+        if hasattr(self, "scroll_bottom_btn"):
+            self.scroll_bottom_btn.setVisible(not at_bottom and bar.maximum() > 60)
 
     @staticmethod
     def _md_context(m):
