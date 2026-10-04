@@ -651,13 +651,13 @@ class Gadget(QWidget):
             try:
                 if want_stop:
                     profiles.stop(prof)
-                    # vision parked the always-on tier: bring it back
-                    if prof.key == "vision" and self.settings.value("parked_services", False, bool):
+                    # dual-GPU profiles parked the always-on tier: bring it back
+                    if prof.key in ("vision", "agent-27b") and self.settings.value("parked_services", False, bool):
                         self.settings.setValue("parked_services", False)
                         profiles.start(profiles.PROFILES["services"])
                 else:
                     for c in profiles.active_conflicts(prof):
-                        if prof.key == "vision" and c.key == "services":
+                        if prof.key in ("vision", "agent-27b") and c.key == "services":
                             self.settings.setValue("parked_services", True)
                         profiles.stop(c)
                     if prof.key == "services":

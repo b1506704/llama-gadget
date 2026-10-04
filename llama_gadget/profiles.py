@@ -1,11 +1,13 @@
 """Server profiles the gadget can switch between.
 
 All servers come from the "Image Description GGUF" project (llama.cpp build + start-server.sh):
-  services    - Qwen3-8B on GPU1 (RTX 3050), always-on systemd user unit, :8080
-  agent-gpu0  - Qwen3-8B on GPU0 (RTX 5060 Ti), long context + --jinja tool calling, :8081.
+  services    - Qwen3.5-9B on GPU1 (RTX 3050), 128K ctx, always-on systemd user unit, :8080
+  agent-gpu0  - Qwen3.5-9B on GPU0 (RTX 5060 Ti), 256K context + --jinja tool calling, :8081.
                 Runs next to `services` (different GPU, different port).
+  agent-27b   - Qwen3.8-27B across both GPUs (deep reasoning agent), 128K context, :8080.
+                Needs both GPUs, so it stops the other profiles while it runs.
   vision      - Qwen3.8-27B + mmproj across both GPUs (image analysis), :8080.
-                Needs both GPUs, so it stops the other two while it runs.
+                Needs both GPUs, so it stops the other profiles while it runs.
 Non-systemd profiles run as transient `systemd-run --user` units (survive the app, die on reboot).
 """
 import os
@@ -16,7 +18,7 @@ from pathlib import Path
 PROJECT = Path(os.environ.get("LLAMA_PROJECT", Path.home() / "Production" / "Image Description GGUF"))
 MODEL_DIR = Path(os.environ.get("QWEN_MODEL_DIR", "/home/lbaoanhdev97/comfy/ComfyUI/models/unet"))
 SERVER_BIN = PROJECT / "build" / "bin" / "llama-server"
-AGENT_CTX = int(os.environ.get("AGENT_GPU0_CTX", 65536))
+AGENT_CTX = int(os.environ.get("AGENT_GPU0_CTX", 262144))
 
 
 @dataclass(frozen=True)
@@ -37,14 +39,18 @@ class Profile:
 
 
 PROFILES = {p.key: p for p in (
-    Profile("services", "Services · Qwen3-8B · GPU1 (always-on)", 8080, "llama-services.service", "GPU1", False,
-            ("vision",), "You are a concise, helpful assistant.", managed=True),
-    Profile("agent-gpu0", f"Agent · Qwen3-8B {AGENT_CTX // 1024}K · GPU0", 8081, "llama-agent-gpu0", "GPU0", False,
-            ("vision",),
+    Profile("services", "Services · Qwen3.5-9B 128K · GPU1 (always-on)", 8080, "llama-services.service", "GPU1", False,
+            ("vision", "agent-27b"), "You are a concise, helpful assistant.", managed=True),
+    Profile("agent-gpu0", f"Agent · Qwen3.5-9B {AGENT_CTX // 1024}K · GPU0", 8081, "llama-agent-gpu0", "GPU0", False,
+            ("vision", "agent-27b"),
             "You are an agentic assistant. Work step by step: plan briefly, use the tools you are given, "
             "verify results, and ask when information is missing."),
+    Profile("agent-27b", "Agent · Qwen3.8-27B 128K · GPU0+1 (deep reasoning)", 8080, "llama-agent-27b", "GPU0+GPU1", False,
+            ("services", "agent-gpu0", "vision"),
+            "You are an expert agentic reasoning assistant. Work step by step: plan deeply, use the tools you are given, "
+            "verify results, and provide rigorous, well-reasoned solutions."),
     Profile("vision", "Image analysis · Qwen3.8-27B vision · GPU0+1", 8080, "llama-vision", "GPU0+GPU1", True,
-            ("services", "agent-gpu0"),
+            ("services", "agent-gpu0", "agent-27b"),
             "You are an image analysis assistant. Examine the attached image(s) carefully: describe content, "
             "objects, layout, any visible text (OCR) and notable details, then answer the user's question "
             "precisely. If no image is attached, ask the user to attach one."),
@@ -81,14 +87,15 @@ def start(p: Profile):
     if p.managed:
         _sctl("start", p.unit, timeout=240)
     elif p.key == "agent-gpu0":
-        cmd = [SERVER_BIN, "-m", MODEL_DIR / "Qwen3-8B-UD-Q4_K_XL.gguf",
+        cmd = [SERVER_BIN, "-m", MODEL_DIR / "Qwen3.5-9B-IQ4_XS.gguf",
                "-c", AGENT_CTX, "--jinja", "-ngl", 99, "-sm", "none", "-mg", 0,
-               # Qwen3-8B is trained at 32K; YaRN stretches it for longer agent contexts
-               "--rope-scaling", "yarn", "--rope-scale", max(1, AGENT_CTX // 32768),
-               "--yarn-orig-ctx", 32768,
                "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn", "on",
                "--port", p.port, "--host", "127.0.0.1", "--parallel", 1, "-t", 12, "-tb", 16, "-ub", 1024]
         r = _run_transient(p, cmd, env={"CUDA_VISIBLE_DEVICES": "0"})
+        if r.returncode:
+            raise RuntimeError(r.stderr.strip() or "systemd-run failed")
+    elif p.key == "agent-27b":
+        r = _run_transient(p, [PROJECT / "start-server.sh", p.port, "agent"], cwd=PROJECT)
         if r.returncode:
             raise RuntimeError(r.stderr.strip() or "systemd-run failed")
     elif p.key == "vision":

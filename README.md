@@ -6,8 +6,9 @@ Small PyQt6 desktop gadget and utility for CachyOS to chat with, monitor, and to
 
 Switch profiles instantly via the header dropdown:
 
-- **Services (Default, always-on)**: Qwen3-8B UD-Q4_K_XL pinned to **GPU 1** (RTX 3050), port `8080`, 32K context. Managed by `systemd --user` (`llama-services.service`).
-- **Agent GPU0 (Agentic workflow)**: Qwen3-8B UD-Q4_K_XL pinned to **GPU 0** (RTX 5060 Ti), port `8081`, **64K context** (YaRN RoPE scaling), `--jinja` enabled for tool calling and agentic tasks. Runs alongside the services tier with ~60 tok/s generation.
+- **Services (Default, always-on)**: Qwen3.5-9B IQ4_XS pinned to **GPU 1** (RTX 3050), port `8080`, **128K context**. Managed by `systemd --user` (`llama-services.service`).
+- **Agent GPU0 (Fast agentic workflow)**: Qwen3.5-9B IQ4_XS pinned to **GPU 0** (RTX 5060 Ti), port `8081`, **256K context** (native), `--jinja` enabled for tool calling and agentic tasks. Runs alongside the services tier with ~68 tok/s generation.
+- **Agent 27B (Deep reasoning)**: Qwen3.8-27B UD-IQ4_XS text-only dual-GPU layer split across GPU 0 + GPU 1, port `8080`, **128K context**, `--jinja` enabled. Maximum reasoning depth and coding capability (~19 tok/s). Automatically parks the services tier while active and restores it when stopped.
 - **Image Analysis (Vision)**: Qwen3.8-27B UD-IQ4_XS + `mmproj-F16` dual-GPU layer split across GPU 0 + GPU 1, port `8080`, 32K context. Supports image file attachment, image drag & drop, and direct clipboard image pasting (`Ctrl+V`). Automatically parks the services tier while active and restores it when switched away.
 
 ## Features
