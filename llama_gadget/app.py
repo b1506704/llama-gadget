@@ -1,4 +1,4 @@
-"""Llama Gadget - tiny desktop chat + service toggle for the always-on text LLM."""
+import re
 import socket
 import sys
 import threading
@@ -9,9 +9,10 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-                             QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
-                             QSystemTrayIcon, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
+                             QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+                             QMessageBox, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
+                             QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
 from .chat import ChatWorker
@@ -22,6 +23,14 @@ from .files import (UnsupportedFile, build_folder_context, parse_file, read_cand
 
 DEFAULT_USER = socket.gethostname()  # PC name
 COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
+
+
+def clean_endpoint(url: str) -> str:
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
+    return url.rstrip("/")
 
 STYLE = """
 QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
@@ -281,11 +290,18 @@ class Gadget(QWidget):
         prow.addWidget(self.profile_cb, 1)
         lay.addLayout(prow)
 
+        erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
-        self.endpoint_lbl.setText(f"Endpoint: {self.profile.base_url}/v1\nModel: –")
-        lay.addWidget(self.endpoint_lbl)
+        self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
+        self.edit_ep_btn = QPushButton("✎")
+        self.edit_ep_btn.setFixedSize(26, 26)
+        self.edit_ep_btn.setToolTip("Edit endpoint URL")
+        self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
+        erow.addWidget(self.endpoint_lbl, 1)
+        erow.addWidget(self.edit_ep_btn)
+        lay.addLayout(erow)
 
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
         self.gadget_cb.toggled.connect(self._apply_gadget)
@@ -428,6 +444,22 @@ class Gadget(QWidget):
         prow.addWidget(self.prompt_msg, 1)
         lay.addLayout(prow)
 
+        lay.addWidget(QLabel("<b>Endpoint URL</b> (OpenAI-compatible /v1)"))
+        erow = QHBoxLayout()
+        self.endpoint_edit = QLineEdit(self.current_base_url())
+        apply_ep = QPushButton("Apply")
+        apply_ep.clicked.connect(self._apply_endpoint)
+        self.endpoint_edit.returnPressed.connect(self._apply_endpoint)
+        reset_ep = QPushButton("Reset to default")
+        reset_ep.clicked.connect(self._reset_endpoint)
+        erow.addWidget(self.endpoint_edit, 1)
+        erow.addWidget(apply_ep)
+        erow.addWidget(reset_ep)
+        lay.addLayout(erow)
+        self.endpoint_msg = QLabel()
+        self.endpoint_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        lay.addWidget(self.endpoint_msg)
+
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
         self.db_status = QLabel()
         self.db_status.setWordWrap(True)
@@ -486,19 +518,63 @@ class Gadget(QWidget):
         self.tabs.setCurrentIndex(0)
 
     # ---------------------------------------------------------------- service / stats
+    def current_base_url(self) -> str:
+        saved = self.settings.value(f"endpoint_{self.profile.key}", None, str)
+        return saved or self.profile.base_url
+
+    def _set_endpoint(self, url: str):
+        cleaned = clean_endpoint(url)
+        self.settings.setValue(f"endpoint_{self.profile.key}", cleaned)
+        if hasattr(self, "endpoint_edit"):
+            self.endpoint_edit.setText(cleaned)
+        if hasattr(self, "endpoint_msg"):
+            self.endpoint_msg.setText(f"Updated for {self.profile.key}: {cleaned} · {time.strftime('%H:%M:%S')}")
+        self.endpoint_lbl.setText(f"Endpoint: {cleaned}/v1 ({self.profile.unit})\nModel: –")
+        self.n_ctx = 0
+        self._set_model(None)
+        self._poll()
+
+    def _apply_endpoint(self):
+        txt = self.endpoint_edit.text().strip()
+        if txt:
+            self._set_endpoint(txt)
+
+    def _reset_endpoint(self):
+        self.settings.remove(f"endpoint_{self.profile.key}")
+        default_url = self.profile.base_url
+        if hasattr(self, "endpoint_edit"):
+            self.endpoint_edit.setText(default_url)
+        if hasattr(self, "endpoint_msg"):
+            self.endpoint_msg.setText(f"Reset to default: {default_url}")
+        self.endpoint_lbl.setText(f"Endpoint: {default_url}/v1 ({self.profile.unit})\nModel: –")
+        self.n_ctx = 0
+        self._set_model(None)
+        self._poll()
+
+    def _prompt_edit_endpoint(self):
+        current = self.current_base_url()
+        text, ok = QInputDialog.getText(
+            self, "Edit Endpoint URL",
+            f"Endpoint URL for {self.profile.label}:",
+            text=current
+        )
+        if ok and text.strip():
+            self._set_endpoint(text.strip())
+
     def _poll(self):
         prof = self.profile
+        base_url = self.current_base_url()
 
         def job():
-            st = service.status(prof.base_url, prof.unit)
+            st = service.status(base_url, prof.unit)
             self.bridge.status.emit(st)
             self.bridge.gpus.emit(service.gpu_stats())
             if st == "offline":
                 self.bridge.model.emit(None)
                 return
             if not self.n_ctx:
-                self.bridge.ctx.emit(service.n_ctx(prof.base_url))
-            self.bridge.model.emit(service.model_info(prof.base_url))
+                self.bridge.ctx.emit(service.n_ctx(base_url))
+            self.bridge.model.emit(service.model_info(base_url))
         threading.Thread(target=job, daemon=True).start()
 
     def _set_model(self, info):
@@ -507,9 +583,10 @@ class Gadget(QWidget):
         name, params = info or ("not loaded", "")
         ctx = f" · {self.n_ctx:,} ctx" if self.n_ctx and info else ""
         self.model_name = name
-        self.endpoint_lbl.setText(f"Endpoint: {self.profile.base_url}/v1 ({self.profile.unit})\n"
+        base_url = self.current_base_url()
+        self.endpoint_lbl.setText(f"Endpoint: {base_url}/v1 ({self.profile.unit})\n"
                                   f"Model: {name}" + (f" · {params}" if params else "") + ctx)
-        self.endpoint_lbl.setToolTip(f"{self.profile.base_url}/v1/chat/completions · {self.profile.gpus}")
+        self.endpoint_lbl.setToolTip(f"{base_url}/v1/chat/completions · {self.profile.gpus}")
 
     def _set_gpus(self, gpus):
         self.gpu_lbl.setText("\n".join(
@@ -541,7 +618,9 @@ class Gadget(QWidget):
         self.n_ctx = 0
         self.model_name = ""
         self.state = "offline"
-        self.endpoint_lbl.setText(f"Endpoint: {self.profile.base_url}/v1\nModel: –")
+        self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
+        if hasattr(self, "endpoint_edit"):
+            self.endpoint_edit.setText(self.current_base_url())
         # profile-specific system prompt + UI hints
         self.system_prompt = self._load_prompt()
         self.prompt_edit.setPlainText(self.system_prompt)
@@ -587,7 +666,7 @@ class Gadget(QWidget):
             except Exception as e:  # noqa: BLE001
                 err = str(e)
             self._busy_toggle = False
-            self.bridge.status.emit(service.status(prof.base_url, prof.unit))
+            self.bridge.status.emit(service.status(self.current_base_url(), prof.unit))
             if err:
                 self.bridge.error.emit(f"{prof.label}: {err}")
         threading.Thread(target=job, daemon=True).start()
@@ -704,7 +783,7 @@ class Gadget(QWidget):
         self.last_speed = ""
 
         payload = self._payload()
-        self.worker = ChatWorker(payload, base_url=self.profile.base_url, parent=self)
+        self.worker = ChatWorker(payload, base_url=self.current_base_url(), parent=self)
         self.worker.token.connect(self._on_token)
         self.worker.stats.connect(self._on_stats)
         self.worker.finished_ok.connect(self._on_done)

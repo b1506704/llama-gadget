@@ -18,6 +18,7 @@ Switch profiles instantly via the header dropdown:
   - Context tokens used vs context window limit (`n_ctx`), plus turn count.
   - Per-GPU hardware monitoring: GPU utilization %, VRAM used/total, and temperatures via `nvidia-smi`.
   - Endpoint URL and loaded model metadata (`n_params`, context size).
+- **Editable Endpoint**: Modify the OpenAI-compatible endpoint URL directly using the ✎ button in the header or via the Settings tab. Persisted per profile with automatic URL sanitization and one-click reset to default.
 - **Rich formatting**: Markdown rendering (tables, code blocks, lists) with per-message timestamps.
 - **Persistent Chat History**: SQLite storage (`llama_gadget.db` in project root, gitignored). Browse, open, and delete past sessions.
 - **Folder Context**: Smart git-aware folder scanner (skips binaries, node_modules, lockfiles, virtual environments). Priority ranking (docs → config → source) and interactive selection dialog sized to the available context window.
