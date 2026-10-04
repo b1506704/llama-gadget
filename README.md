@@ -9,6 +9,7 @@ Small PyQt6 desktop utility for CachyOS: toggle the always-on `llama-services` s
 - **Chat history** in SQLite (default `llama_gadget.db` in the project root, gitignored); History tab lists/open/deletes sessions
 - **Settings** tab: user name (default = PC hostname), per-user editable system prompt, DB browse/select with live status (integrity, size, counts)
 - **Attach files** (button or drag & drop): txt/md/code/json/csv/html/docx/pdf (pdf needs `pdftotext` or `pypdf`); capped at 40k chars each
+- **Folder context** (📁 Folder button or drop a folder): git-aware scan (respects .gitignore, skips binaries, node_modules, lockfiles…), ranks docs → config → source, review dialog with a token budget sized to the free context window; stored in the session and sent as part of the system prompt
 - **Clipboard memory**: everything you copy is remembered (last 50, in the DB); 📋 Clips or Ctrl+Shift+V pastes one fast
 - Streaming chat, **New session** to reset the conversation
 - **Gadget mode**: frameless, always-on-top, drag to move (Wayland compositors may ignore on-top/move; use your WM's rules)

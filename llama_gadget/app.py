@@ -9,14 +9,15 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
                              QSystemTrayIcon, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
 
 from . import service
 from .chat import ChatWorker
 from .db import DEFAULT_DB, Database
-from .files import UnsupportedFile, parse_file
+from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
+                    scan_folder)
 
 DEFAULT_PROMPT = "You are a concise, helpful assistant."
 DEFAULT_USER = socket.gethostname()  # PC name
@@ -63,6 +64,8 @@ def fmt_ts(ts: str) -> str:
 def model_text(m: dict) -> str:
     """Message text as the LLM sees it (attached file contents appended)."""
     out = m["content"]
+    if m["role"] == "context":
+        return out
     for a in m.get("attachments", []):
         note = " (truncated)" if a.get("truncated") else ""
         out += f"\n\n[Attached file: {a['name']}{note}]\n~~~~\n{a['text']}\n~~~~"
@@ -93,6 +96,67 @@ class InputBox(QTextEdit):
     def insertFromMimeData(self, source):  # paste as plain text only
         if source.hasText():
             self.insertPlainText(source.text())
+
+
+class FolderDialog(QDialog):
+    """Review which files from a scanned folder go into the session context."""
+
+    def __init__(self, parent, root, files, total_seen, budget):
+        super().__init__(parent)
+        self.setWindowTitle(f"Folder context — {Path(root).name}")
+        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
+        self.resize(460, 520)
+        self.files, self.budget = files, budget
+        lay = QVBoxLayout(self)
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+        self.list = QListWidget()
+        used = 0
+        for f in files:  # auto-select by priority until the budget is full
+            item = QListWidgetItem(f"{f['rel']}   ({f['chars']:,}{'+' if f['truncated'] else ''})")
+            fits = used + f["chars"] <= budget
+            if fits:
+                used += f["chars"]
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if fits else Qt.CheckState.Unchecked)
+            self.list.addItem(item)
+        self.list.itemChanged.connect(self._update)
+        lay.addWidget(self.list, 1)
+        self.total_seen = total_seen
+        row = QHBoxLayout()
+        for text, state in (("Select all", Qt.CheckState.Checked), ("Select none", Qt.CheckState.Unchecked)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, st=state: self._set_all(st))
+            row.addWidget(b)
+        row.addStretch()
+        ok, cancel = QPushButton("Add to session"), QPushButton("Cancel")
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        self._update()
+
+    def _set_all(self, st):
+        self.list.blockSignals(True)
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(st)
+        self.list.blockSignals(False)
+        self._update()
+
+    def selected(self):
+        return [f for i, f in enumerate(self.files) if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+    def _update(self, *_):
+        sel = self.selected()
+        chars = sum(f["chars"] for f in sel)
+        over = chars > self.budget
+        color = "#f85149" if over else "#3fb950"
+        self.info.setText(
+            f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
+            f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
+            f" of ~{self.budget:,} chars budget" + (" — <b>over budget</b>" if over else ""))
 
 
 class Gadget(QWidget):
@@ -243,12 +307,16 @@ class Gadget(QWidget):
         self.attach_btn = QPushButton("📎 File")
         self.attach_btn.setToolTip("Attach text files (txt, md, code, json, csv, html, docx, pdf…) — or drop them on the window")
         self.attach_btn.clicked.connect(self._pick_files)
+        self.folder_btn = QPushButton("📁 Folder")
+        self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
+                                   "skips binaries/node_modules) — or drop a folder on the window")
+        self.folder_btn.clicked.connect(self._pick_folder)
         self.clip_btn = QPushButton("📋 Clips")
         self.clip_btn.setToolTip("Clipboard memory (Ctrl+Shift+V)")
         self.clip_btn.clicked.connect(self._show_clip_menu)
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send)
-        for b in (self.refresh_btn, self.attach_btn, self.clip_btn):
+        for b in (self.refresh_btn, self.attach_btn, self.folder_btn, self.clip_btn):
             row.addWidget(b)
         row.addStretch()
         row.addWidget(self.send_btn)
@@ -356,7 +424,10 @@ class Gadget(QWidget):
             e.acceptProposedAction()
 
     def dropEvent(self, e):
-        self._add_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        self._add_files([p for p in paths if not Path(p).is_dir()])
+        for d in (p for p in paths if Path(p).is_dir()):
+            self._add_folder(d)
         self.tabs.setCurrentIndex(0)
 
     # ---------------------------------------------------------------- service / stats
@@ -433,7 +504,8 @@ class Gadget(QWidget):
         stick = bar.value() >= bar.maximum() - 24
         parts = []
         for m in self.msgs:
-            parts.append(self._md_message(m["role"], m["content"], m["ts"], m.get("attachments", [])))
+            parts.append(self._md_context(m) if m["role"] == "context" else
+                         self._md_message(m["role"], m["content"], m["ts"], m.get("attachments", [])))
         if self.worker is not None:
             parts.append(self._md_message("assistant", self.reply or "_…_", time.strftime("%Y-%m-%d %H:%M:%S"), []))
         if self.last_error:
@@ -443,6 +515,15 @@ class Gadget(QWidget):
         self.view.setMarkdown("\n\n---\n\n".join(parts))
         if stick:
             bar.setValue(bar.maximum())
+
+    @staticmethod
+    def _md_context(m):
+        files = m.get("attachments", [])
+        chars = sum(a["chars"] for a in files)
+        shown = "\n".join(f"- `{a['name']}`" for a in files[:25])
+        more = f"\n- … +{len(files) - 25} more" if len(files) > 25 else ""
+        return (f"**📁 Folder context** · *{fmt_ts(m['ts'])}*\n\n{m['content'].splitlines()[0][2:]}\n\n"
+                f"{len(files)} files · {chars:,} chars added to this session's context\n\n{shown}{more}")
 
     @staticmethod
     def _md_message(role, content, ts, attachments):
@@ -480,8 +561,7 @@ class Gadget(QWidget):
         self._ntok = 0
         self.last_speed = ""
 
-        payload = [{"role": "system", "content": self.system_prompt}]
-        payload += [{"role": m["role"], "content": model_text(m)} for m in self.msgs]
+        payload = self._payload()
         self.worker = ChatWorker(payload, parent=self)
         self.worker.token.connect(self._on_token)
         self.worker.stats.connect(self._on_stats)
@@ -491,6 +571,16 @@ class Gadget(QWidget):
         self._update_controls()
         self._update_stats()
         self._render()
+
+    def _payload(self):
+        """System prompt + folder contexts merged into ONE system message (Qwen templates want that)."""
+        system = self.system_prompt
+        ctxs = [m["content"] for m in self.msgs if m["role"] == "context"]
+        if ctxs:
+            system += ("\n\nThe user loaded the following folder(s) as reference context for this "
+                       "conversation. Use it to answer questions about the files.\n\n" + "\n\n".join(ctxs))
+        return [{"role": "system", "content": system}] + [
+            {"role": m["role"], "content": model_text(m)} for m in self.msgs if m["role"] != "context"]
 
     def _on_token(self, t):
         self.reply += t
@@ -551,6 +641,46 @@ class Gadget(QWidget):
         if errs:
             QMessageBox.warning(self, "Could not read file", "\n".join(errs))
         self._update_attachments()
+
+    def _pick_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Add folder as session context", str(Path.home()))
+        if d:
+            self._add_folder(d)
+
+    def _add_folder(self, root):
+        if self.worker is not None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            entries, seen = scan_folder(root)
+            files = read_candidates(entries)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not files:
+            QMessageBox.information(self, "Folder context", f"No text files found in\n{root}")
+            return
+        # ~60% of the free window, ~3 chars/token, leaving room for the conversation itself
+        if self.n_ctx:
+            budget = max(8000, int((self.n_ctx - self.ctx_used - 4096) * 0.6 * 3))
+        else:
+            budget = 50000
+        dlg = FolderDialog(self, root, files, seen, budget)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected():
+            return
+        picked = dlg.selected()
+        text = build_folder_context(root, picked, [e["rel"] for e in entries])
+        if self.session_id is None:
+            self.session_id = self.db.create_session(self.user, f"📁 {Path(root).name}")
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        meta = [dict(name=f["rel"], chars=f["chars"], truncated=f["truncated"]) for f in picked]
+        mid = self.db.add_message(self.session_id, "context", text, meta, ts)
+        self.msgs.append(dict(id=mid, role="context", content=text, ts=ts, attachments=meta))
+        self.ctx_used += len(text) // 3
+        self.ctx_exact = False
+        self._update_stats()
+        self._render()
+        self._refresh_history()
+        self._refresh_db_status()
 
     def _clear_attachments(self):
         self.attachments = []

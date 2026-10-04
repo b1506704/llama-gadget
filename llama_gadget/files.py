@@ -1,5 +1,6 @@
 """Parse user-supplied files into plain text for the chat."""
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -72,7 +73,7 @@ def _pdf(path):
     return "\n".join(p.extract_text() or "" for p in PdfReader(str(path)).pages)
 
 
-def parse_file(path):
+def parse_file(path, max_chars=MAX_CHARS):
     """Return dict(name, text, truncated, chars). Raises UnsupportedFile / OSError."""
     p = Path(path)
     if p.stat().st_size > MAX_BYTES:
@@ -97,7 +98,110 @@ def parse_file(path):
     if not text:
         raise UnsupportedFile("no text content found")
     chars = len(text)
-    truncated = chars > MAX_CHARS
+    truncated = chars > max_chars
     if truncated:
-        text = text[:MAX_CHARS]
+        text = text[:max_chars]
     return dict(name=p.name, text=text, truncated=truncated, chars=chars)
+
+
+# ----------------------------------------------------------------- folder scanning
+IGNORE_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", "env", ".tox",
+               ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist", "target", ".next", ".nuxt",
+               ".cache", ".idea", ".vscode", "coverage", "site-packages", ".gradle", "vendor"}
+SKIP_SUFFIXES = (".lock", ".map", ".min.js", ".min.css", ".svg", ".pyc", ".log", ".sqlite", ".db")
+SKIP_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "Cargo.lock", ".DS_Store"}
+DOC_NAMES = ("readme", "contributing", "claude", "agents", "architecture", "overview", "design")
+CONFIG_NAMES = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "cargo.toml",
+                "go.mod", "pom.xml", "build.gradle", "makefile", "dockerfile", "docker-compose.yml",
+                "tsconfig.json", "cmakelists.txt"}
+DOC_EXTS = {".md", ".rst", ".txt", ".adoc"}
+FOLDER_MAX_FILE_BYTES = 1024 * 1024
+FOLDER_FILE_CHARS = 8000   # per-file cap in folder mode
+FOLDER_MAX_CANDIDATES = 400
+
+
+def _git_files(root: Path):
+    if not shutil.which("git"):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                           capture_output=True, timeout=30)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return [x for x in r.stdout.decode("utf-8", "replace").split("\0") if x]
+
+
+def _walk_files(root: Path):
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in IGNORE_DIRS and not x.startswith(".")]
+        for f in files:
+            out.append(os.path.relpath(os.path.join(d, f), root))
+    return out
+
+
+def _category(rel: str) -> int:
+    p = Path(rel)
+    name, ext = p.name.lower(), p.suffix.lower()
+    if p.stem.lower() in DOC_NAMES or (ext in DOC_EXTS and len(p.parts) == 1):
+        return 0
+    if name in CONFIG_NAMES:
+        return 1
+    if ext in DOC_EXTS:
+        return 3
+    return 2
+
+
+def scan_folder(root):
+    """Find text files under `root` (git-aware), ranked by usefulness.
+
+    Returns (entries, total_files_seen). Each entry: dict(rel, path, size, cat). Binary, huge, lock/minified
+    and ignored files are dropped. Respects .gitignore when the folder is a git repo.
+    """
+    root = Path(root)
+    rels = _git_files(root) or _walk_files(root)
+    entries = []
+    for rel in rels:
+        parts = Path(rel).parts
+        if any(x in IGNORE_DIRS for x in parts[:-1]) or parts[-1] in SKIP_NAMES \
+                or rel.lower().endswith(SKIP_SUFFIXES):
+            continue
+        path = root / rel
+        try:
+            size = path.stat().st_size
+            if not path.is_file() or size == 0 or size > FOLDER_MAX_FILE_BYTES:
+                continue
+            with open(path, "rb") as fh:
+                _decode(fh.read(4096))
+        except (OSError, UnsupportedFile):
+            continue
+        entries.append(dict(rel=rel, path=str(path), size=size, cat=_category(rel)))
+    entries.sort(key=lambda e: (e["cat"], len(Path(e["rel"]).parts), e["size"], e["rel"]))
+    return entries, len(rels)
+
+
+def read_candidates(entries, limit=FOLDER_MAX_CANDIDATES):
+    """Read (capped) text for the top `limit` entries; adds 'text', 'chars', 'truncated'."""
+    out = []
+    for e in entries[:limit]:
+        try:
+            r = parse_file(e["path"], FOLDER_FILE_CHARS)
+        except (UnsupportedFile, OSError):
+            continue
+        out.append({**e, "text": r["text"], "chars": len(r["text"]), "truncated": r["truncated"]})
+    return out
+
+
+def build_folder_context(root, picked, all_rels):
+    """Assemble the context block: file tree + selected file contents."""
+    root = Path(root)
+    tree = sorted(all_rels)
+    lines = tree[:300] + ([f"... (+{len(tree) - 300} more)"] if len(tree) > 300 else [])
+    out = [f"# Folder context: {root.name}  ({root})", "", "## Text files in folder", *lines, "",
+           "## File contents"]
+    for f in picked:
+        note = " (truncated)" if f["truncated"] else ""
+        out += [f"### {f['rel']}{note}", "~~~~", f["text"], "~~~~", ""]
+    return "\n".join(out).strip()
