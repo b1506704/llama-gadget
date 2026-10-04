@@ -73,6 +73,7 @@ class Bridge(QObject):
     status = pyqtSignal(str)
     gpus = pyqtSignal(list)
     ctx = pyqtSignal(object)
+    model = pyqtSignal(object)
 
 
 class InputBox(QTextEdit):
@@ -131,6 +132,7 @@ class Gadget(QWidget):
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
         self.bridge.gpus.connect(self._set_gpus)
+        self.bridge.model.connect(self._set_model)
         self.bridge.ctx.connect(lambda n: setattr(self, "n_ctx", n or self.n_ctx))
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
@@ -179,6 +181,12 @@ class Gadget(QWidget):
         top.addWidget(self.power_btn)
         top.addWidget(close)
         lay.addLayout(top)
+
+        self.endpoint_lbl = QLabel()
+        self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_lbl.setText(f"Endpoint: {service.BASE_URL}/v1\nModel: –")
+        lay.addWidget(self.endpoint_lbl)
 
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
         self.gadget_cb.toggled.connect(self._apply_gadget)
@@ -358,7 +366,17 @@ class Gadget(QWidget):
             self.bridge.gpus.emit(service.gpu_stats())
             if not self.n_ctx:
                 self.bridge.ctx.emit(service.n_ctx())
+            self.bridge.model.emit(service.model_info())
         threading.Thread(target=job, daemon=True).start()
+
+    def _set_model(self, info):
+        if not info:
+            self.n_ctx = 0  # re-read context size when a (possibly different) model comes back
+        name, params = info or ("not loaded", "")
+        ctx = f" · {self.n_ctx:,} ctx" if self.n_ctx and info else ""
+        self.endpoint_lbl.setText(f"Endpoint: {service.BASE_URL}/v1 ({service.UNIT})\n"
+                                  f"Model: {name}" + (f" · {params}" if params else "") + ctx)
+        self.endpoint_lbl.setToolTip(f"{service.BASE_URL}/v1/chat/completions")
 
     def _set_gpus(self, gpus):
         self.gpu_lbl.setText("\n".join(

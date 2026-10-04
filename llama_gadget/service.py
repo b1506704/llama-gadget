@@ -67,3 +67,16 @@ def gpu_stats():
             gpus.append(dict(index=int(f[0]), name=f[1].replace("NVIDIA GeForce ", ""), util=int(f[2]),
                              used=int(f[3]), total=int(f[4]), temp=int(f[5])))
     return gpus
+
+
+def model_info(base_url=BASE_URL):
+    """(model file name, size string) of the loaded model, or None."""
+    import json
+    from pathlib import Path
+    try:
+        with urllib.request.urlopen(base_url + "/v1/models", timeout=2) as r:
+            m = json.load(r)["data"][0]
+    except Exception:
+        return None
+    n = (m.get("meta") or {}).get("n_params")
+    return Path(m["id"]).name, (f"{n / 1e9:.1f}B params" if n else "")
