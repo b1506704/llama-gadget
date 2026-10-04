@@ -10,10 +10,10 @@ def _systemctl(*args, timeout=60):
     return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout)
 
 
-def unit_state() -> str:
+def unit_state(unit=UNIT) -> str:
     """systemd ActiveState: active, inactive, activating, failed, ..."""
     try:
-        return _systemctl("is-active", UNIT, timeout=5).stdout.strip() or "unknown"
+        return _systemctl("is-active", unit, timeout=5).stdout.strip() or "unknown"
     except Exception:
         return "unknown"
 
@@ -26,12 +26,11 @@ def healthy(base_url=BASE_URL) -> bool:
         return False
 
 
-def status(base_url=BASE_URL) -> str:
-    """One of: online, loading, offline."""
-    if healthy(base_url):
-        return "online"
-    return "loading" if unit_state() == "activating" else (
-        "loading" if unit_state() == "active" else "offline")
+def status(base_url=BASE_URL, unit=UNIT) -> str:
+    """One of: online, loading, offline (the unit must be running AND answering /health)."""
+    if unit_state(unit) in ("active", "activating"):
+        return "online" if healthy(base_url) else "loading"
+    return "offline"
 
 
 def start():

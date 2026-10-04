@@ -1,24 +1,36 @@
 # Llama Gadget
 
-Small PyQt6 desktop utility for CachyOS: toggle the always-on `llama-services` systemd user unit
-(Qwen3-8B on the second GPU, `127.0.0.1:8080`) and chat with it.
+Small PyQt6 desktop gadget and utility for CachyOS to chat with, monitor, and toggle local `llama.cpp` inference profiles across multiple GPUs.
 
-- Service on/off button + tray icon (green = online, amber = loading, red = offline)
-- Live stats: context used/window, turns, tok/s (generation + prompt), per-GPU util/VRAM/temp
-- Markdown-rendered replies (tables, code, lists) with a timestamp on every message
-- **Chat history** in SQLite (default `llama_gadget.db` in the project root, gitignored); History tab lists/open/deletes sessions
-- **Settings** tab: user name (default = PC hostname), per-user editable system prompt, DB browse/select with live status (integrity, size, counts)
-- **Attach files** (button or drag & drop): txt/md/code/json/csv/html/docx/pdf (pdf needs `pdftotext` or `pypdf`); capped at 40k chars each
-- **Folder context** (📁 Folder button or drop a folder): git-aware scan (respects .gitignore, skips binaries, node_modules, lockfiles…), ranks docs → config → source, review dialog with a token budget sized to the free context window; stored in the session and sent as part of the system prompt
-- **Clipboard memory**: everything you copy is remembered (last 50, in the DB); 📋 Clips or Ctrl+Shift+V pastes one fast
-- Streaming chat, **New session** to reset the conversation
-- **Gadget mode**: frameless, always-on-top, drag to move (Wayland compositors may ignore on-top/move; use your WM's rules)
-- Closing the window hides it to the tray
+## Profiles
+
+Switch profiles instantly via the header dropdown:
+
+- **Services (Default, always-on)**: Qwen3-8B UD-Q4_K_XL pinned to **GPU 1** (RTX 3050), port `8080`, 32K context. Managed by `systemd --user` (`llama-services.service`).
+- **Agent GPU0 (Agentic workflow)**: Qwen3-8B UD-Q4_K_XL pinned to **GPU 0** (RTX 5060 Ti), port `8081`, **64K context** (YaRN RoPE scaling), `--jinja` enabled for tool calling and agentic tasks. Runs alongside the services tier with ~60 tok/s generation.
+- **Image Analysis (Vision)**: Qwen3.8-27B UD-IQ4_XS + `mmproj-F16` dual-GPU layer split across GPU 0 + GPU 1, port `8080`, 32K context. Supports image file attachment, image drag & drop, and direct clipboard image pasting (`Ctrl+V`). Automatically parks the services tier while active and restores it when switched away.
+
+## Features
+
+- **Profile switching & service toggle**: Start/Stop button and system tray icon (green = online, amber = loading, red = offline).
+- **Live monitoring**:
+  - Live generation speed (tok/s during streaming and final prompt/generation stats from `llama.cpp`).
+  - Context tokens used vs context window limit (`n_ctx`), plus turn count.
+  - Per-GPU hardware monitoring: GPU utilization %, VRAM used/total, and temperatures via `nvidia-smi`.
+  - Endpoint URL and loaded model metadata (`n_params`, context size).
+- **Rich formatting**: Markdown rendering (tables, code blocks, lists) with per-message timestamps.
+- **Persistent Chat History**: SQLite storage (`llama_gadget.db` in project root, gitignored). Browse, open, and delete past sessions.
+- **Folder Context**: Smart git-aware folder scanner (skips binaries, node_modules, lockfiles, virtual environments). Priority ranking (docs → config → source) and interactive selection dialog sized to the available context window.
+- **File & Image attachments**:
+  - Text: `.txt`, `.md`, `.py`, `.json`, `.csv`, `.html`, `.docx`, `.pdf` (via `pdftotext` or `pypdf`).
+  - Vision mode: `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.gif`, clipboard image paste.
+- **Clipboard memory**: Automatically saves text copies to an SQLite ring buffer (last 50 clips). Quick menu via `📋 Clips` button or `Ctrl+Shift+V`.
+- **Customizable System Prompts**: Saved per user (defaults to PC hostname) and per profile.
+- **Gadget mode**: Frameless, translucent background, stays-on-top, draggable. Closing window minimizes to the system tray.
 
 ## Run
-```
+```bash
 sudo pacman -S python-pyqt6   # or: pip install -r requirements.txt
 ./run.sh
-./install.sh [--autostart]    # app-menu entry / start at login
+./install.sh [--autostart]    # add application menu entry or start at login
 ```
-Edit `llama_gadget/service.py` to change the unit name or port.

@@ -9,17 +9,17 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                              QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
                              QSystemTrayIcon, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget)
 
-from . import service
+from . import profiles, service
 from .chat import ChatWorker
 from .db import DEFAULT_DB, Database
+from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
 
-DEFAULT_PROMPT = "You are a concise, helpful assistant."
 DEFAULT_USER = socket.gethostname()  # PC name
 COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
 
@@ -28,6 +28,8 @@ QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10
 QLabel, QCheckBox { color: #d0d4da; }
 QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
     border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
+QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
+QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
 QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
 QListWidget::item:selected { background: #2a3140; }
 QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
@@ -67,9 +69,24 @@ def model_text(m: dict) -> str:
     if m["role"] == "context":
         return out
     for a in m.get("attachments", []):
+        if a.get("kind") == "image":
+            continue
         note = " (truncated)" if a.get("truncated") else ""
         out += f"\n\n[Attached file: {a['name']}{note}]\n~~~~\n{a['text']}\n~~~~"
     return out.strip()
+
+
+def model_content(m: dict, vision: bool):
+    """Message content for the API: plain string, or text+image_url parts for the vision profile."""
+    text = model_text(m)
+    imgs = [a for a in m.get("attachments", []) if a.get("kind") == "image"]
+    if not imgs:
+        return text
+    if not vision:
+        return text + "\n\n[Image(s) attached but this profile has no vision: " + ", ".join(
+            a["name"] for a in imgs) + "]"
+    return [{"type": "text", "text": text or "Analyze the attached image(s)."}] + [
+        {"type": "image_url", "image_url": {"url": a["data"]}} for a in imgs]
 
 
 class Bridge(QObject):
@@ -77,11 +94,13 @@ class Bridge(QObject):
     gpus = pyqtSignal(list)
     ctx = pyqtSignal(object)
     model = pyqtSignal(object)
+    error = pyqtSignal(str)
 
 
 class InputBox(QTextEdit):
     submit = pyqtSignal()
     clip_menu = pyqtSignal()
+    image_pasted = pyqtSignal(object)
 
     def keyPressEvent(self, e):
         mods = e.modifiers()
@@ -93,8 +112,10 @@ class InputBox(QTextEdit):
         else:
             super().keyPressEvent(e)
 
-    def insertFromMimeData(self, source):  # paste as plain text only
-        if source.hasText():
+    def insertFromMimeData(self, source):  # plain text only; images go to the attachment list
+        if source.hasImage() and not source.hasText():
+            self.image_pasted.emit(source.imageData())
+        elif source.hasText():
             self.insertPlainText(source.text())
 
 
@@ -166,6 +187,7 @@ class Gadget(QWidget):
         self.state = "offline"
         self.worker = None
         self.n_ctx = 0
+        self.model_name = ""
         self.ctx_used = 0
         self.ctx_exact = True
         self.last_speed = ""
@@ -185,7 +207,9 @@ class Gadget(QWidget):
             self.db.open(self.settings.value("db_path", str(DEFAULT_DB)))
         except Exception:  # noqa: BLE001 - fall back to default location
             self.db.open(DEFAULT_DB)
-        self.system_prompt = self.db.get_prompt(self.user) or DEFAULT_PROMPT
+        key = self.settings.value("profile", profiles.DEFAULT_PROFILE)
+        self.profile = profiles.PROFILES.get(key, profiles.PROFILES[profiles.DEFAULT_PROFILE])
+        self.system_prompt = self._load_prompt()
 
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
@@ -197,6 +221,7 @@ class Gadget(QWidget):
         self.bridge.status.connect(self._set_status)
         self.bridge.gpus.connect(self._set_gpus)
         self.bridge.model.connect(self._set_model)
+        self.bridge.error.connect(lambda m: QMessageBox.warning(self, 'Profile error', m))
         self.bridge.ctx.connect(lambda n: setattr(self, "n_ctx", n or self.n_ctx))
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
@@ -246,10 +271,20 @@ class Gadget(QWidget):
         top.addWidget(close)
         lay.addLayout(top)
 
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Profile"))
+        self.profile_cb = QComboBox()
+        for p in profiles.PROFILES.values():
+            self.profile_cb.addItem(p.label, p.key)
+        self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
+        self.profile_cb.currentIndexChanged.connect(self._on_profile)
+        prow.addWidget(self.profile_cb, 1)
+        lay.addLayout(prow)
+
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
-        self.endpoint_lbl.setText(f"Endpoint: {service.BASE_URL}/v1\nModel: –")
+        self.endpoint_lbl.setText(f"Endpoint: {self.profile.base_url}/v1\nModel: –")
         lay.addWidget(self.endpoint_lbl)
 
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
@@ -299,13 +334,17 @@ class Gadget(QWidget):
         self.input.setFixedHeight(64)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
+        self.input.image_pasted.connect(self._paste_image)
         lay.addWidget(self.input)
 
         row = QHBoxLayout()
         self.refresh_btn = QPushButton("New session")
         self.refresh_btn.clicked.connect(self.new_session)
         self.attach_btn = QPushButton("📎 File")
-        self.attach_btn.setToolTip("Attach text files (txt, md, code, json, csv, html, docx, pdf…) — or drop them on the window")
+        self.attach_btn.setToolTip("Attach text files (txt, md, code, json, csv, html, docx, pdf…); in the Image "
+                                   "analysis profile also images (or paste / drop them)")
+        if self.profile.vision:
+            self.attach_btn.setText("📎 File / 🖼 Image")
         self.attach_btn.clicked.connect(self._pick_files)
         self.folder_btn = QPushButton("📁 Folder")
         self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
@@ -357,7 +396,7 @@ class Gadget(QWidget):
         urow.addWidget(apply_u)
         lay.addLayout(urow)
 
-        lay.addWidget(QLabel("<b>System prompt</b> (saved per user)"))
+        lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
@@ -432,12 +471,18 @@ class Gadget(QWidget):
 
     # ---------------------------------------------------------------- service / stats
     def _poll(self):
+        prof = self.profile
+
         def job():
-            self.bridge.status.emit(service.status())
+            st = service.status(prof.base_url, prof.unit)
+            self.bridge.status.emit(st)
             self.bridge.gpus.emit(service.gpu_stats())
+            if st == "offline":
+                self.bridge.model.emit(None)
+                return
             if not self.n_ctx:
-                self.bridge.ctx.emit(service.n_ctx())
-            self.bridge.model.emit(service.model_info())
+                self.bridge.ctx.emit(service.n_ctx(prof.base_url))
+            self.bridge.model.emit(service.model_info(prof.base_url))
         threading.Thread(target=job, daemon=True).start()
 
     def _set_model(self, info):
@@ -445,9 +490,10 @@ class Gadget(QWidget):
             self.n_ctx = 0  # re-read context size when a (possibly different) model comes back
         name, params = info or ("not loaded", "")
         ctx = f" · {self.n_ctx:,} ctx" if self.n_ctx and info else ""
-        self.endpoint_lbl.setText(f"Endpoint: {service.BASE_URL}/v1 ({service.UNIT})\n"
+        self.model_name = name
+        self.endpoint_lbl.setText(f"Endpoint: {self.profile.base_url}/v1 ({self.profile.unit})\n"
                                   f"Model: {name}" + (f" · {params}" if params else "") + ctx)
-        self.endpoint_lbl.setToolTip(f"{service.BASE_URL}/v1/chat/completions")
+        self.endpoint_lbl.setToolTip(f"{self.profile.base_url}/v1/chat/completions · {self.profile.gpus}")
 
     def _set_gpus(self, gpus):
         self.gpu_lbl.setText("\n".join(
@@ -465,18 +511,69 @@ class Gadget(QWidget):
         self.power_btn.setEnabled(not self._busy_toggle)
         self._update_controls()
 
+    def _on_profile(self, _i):
+        key = self.profile_cb.currentData()
+        if key == self.profile.key:
+            return
+        if self.worker is not None:
+            self.profile_cb.blockSignals(True)
+            self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
+            self.profile_cb.blockSignals(False)
+            return
+        self.profile = profiles.PROFILES[key]
+        self.settings.setValue("profile", key)
+        self.n_ctx = 0
+        self.model_name = ""
+        self.state = "offline"
+        self.endpoint_lbl.setText(f"Endpoint: {self.profile.base_url}/v1\nModel: –")
+        # profile-specific system prompt + UI hints
+        self.system_prompt = self._load_prompt()
+        self.prompt_edit.setPlainText(self.system_prompt)
+        self.attach_btn.setText("📎 File / 🖼 Image" if self.profile.vision else "📎 File")
+        self._set_status("offline")
+        self._poll()
+
     def toggle_service(self):
         if self._busy_toggle:
             return
-        self._busy_toggle = True
+        prof = self.profile
         want_stop = self.state != "offline"
+        if not want_stop:
+            conflicts = profiles.active_conflicts(prof)
+            if conflicts:
+                names = "\n".join(f"• {c.label}" for c in conflicts)
+                if QMessageBox.question(
+                        self, "Switch profile",
+                        f"Starting “{prof.label}” needs the GPU/port used by:\n{names}\n\nThey will be stopped. Continue?"
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+        self._busy_toggle = True
         self.power_btn.setEnabled(False)
         self.status_lbl.setText("stopping…" if want_stop else "starting…")
 
         def job():
-            service.stop() if want_stop else service.start()
+            err = ""
+            try:
+                if want_stop:
+                    profiles.stop(prof)
+                    # vision parked the always-on tier: bring it back
+                    if prof.key == "vision" and self.settings.value("parked_services", False, bool):
+                        self.settings.setValue("parked_services", False)
+                        profiles.start(profiles.PROFILES["services"])
+                else:
+                    for c in profiles.active_conflicts(prof):
+                        if prof.key == "vision" and c.key == "services":
+                            self.settings.setValue("parked_services", True)
+                        profiles.stop(c)
+                    if prof.key == "services":
+                        self.settings.setValue("parked_services", False)
+                    profiles.start(prof)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
             self._busy_toggle = False
-            self.bridge.status.emit(service.status())
+            self.bridge.status.emit(service.status(prof.base_url, prof.unit))
+            if err:
+                self.bridge.error.emit(f"{prof.label}: {err}")
         threading.Thread(target=job, daemon=True).start()
 
     def _update_stats(self):
@@ -529,8 +626,10 @@ class Gadget(QWidget):
     def _md_message(role, content, ts, attachments):
         who = "🧑 You" if role == "user" else "🤖 Assistant"
         body = content.replace("\n", "  \n") if role == "user" else content
-        files = "".join(f"\n\n📎 `{a['name']}` ({a['chars']:,} chars{', truncated' if a.get('truncated') else ''})"
-                        for a in attachments)
+        files = "".join(
+            f"\n\n🖼 `{a['name']}` ({a.get('w', '?')}×{a.get('h', '?')})" if a.get("kind") == "image" else
+            f"\n\n📎 `{a['name']}` ({a['chars']:,} chars{', truncated' if a.get('truncated') else ''})"
+            for a in attachments)
         return f"**{who}** · *{fmt_ts(ts)}*\n\n{body}{files}"
 
     def _schedule_render(self):
@@ -562,7 +661,7 @@ class Gadget(QWidget):
         self.last_speed = ""
 
         payload = self._payload()
-        self.worker = ChatWorker(payload, parent=self)
+        self.worker = ChatWorker(payload, base_url=self.profile.base_url, parent=self)
         self.worker.token.connect(self._on_token)
         self.worker.stats.connect(self._on_stats)
         self.worker.finished_ok.connect(self._on_done)
@@ -580,7 +679,8 @@ class Gadget(QWidget):
             system += ("\n\nThe user loaded the following folder(s) as reference context for this "
                        "conversation. Use it to answer questions about the files.\n\n" + "\n\n".join(ctxs))
         return [{"role": "system", "content": system}] + [
-            {"role": m["role"], "content": model_text(m)} for m in self.msgs if m["role"] != "context"]
+            {"role": m["role"], "content": model_content(m, self.profile.vision)}
+            for m in self.msgs if m["role"] != "context"]
 
     def _on_token(self, t):
         self.reply += t
@@ -635,11 +735,26 @@ class Gadget(QWidget):
         errs = []
         for p in paths:
             try:
+                if is_image(p):
+                    if not self.profile.vision:
+                        raise UnsupportedFile("images need the “Image analysis” profile (select it above)")
+                    self.attachments.append(load_image(p))
+                    continue
                 self.attachments.append(parse_file(p))
             except (UnsupportedFile, OSError, Exception) as e:  # noqa: BLE001
                 errs.append(f"{Path(p).name}: {e}")
         if errs:
             QMessageBox.warning(self, "Could not read file", "\n".join(errs))
+        self._update_attachments()
+
+    def _paste_image(self, img):
+        if not self.profile.vision:
+            QMessageBox.information(self, "Image paste", "Select the “Image analysis” profile to send images.")
+            return
+        try:
+            self.attachments.append(encode_image(img, f"pasted-{time.strftime('%H%M%S')}.jpg"))
+        except ValueError as e:
+            QMessageBox.warning(self, "Image paste", str(e))
         self._update_attachments()
 
     def _pick_folder(self):
@@ -688,7 +803,8 @@ class Gadget(QWidget):
 
     def _update_attachments(self):
         self.attach_lbl.setText("  ".join(
-            f"📎 {a['name']} ({a['chars']:,}{'+' if a['truncated'] else ''})" for a in self.attachments))
+            f"🖼 {a['name']} ({a['w']}×{a['h']})" if a.get("kind") == "image"
+            else f"📎 {a['name']} ({a['chars']:,}{'+' if a['truncated'] else ''})" for a in self.attachments))
         self.attach_lbl.setVisible(bool(self.attachments))
         self.attach_clear.setVisible(bool(self.attachments))
 
@@ -745,7 +861,8 @@ class Gadget(QWidget):
         self.new_session()
         self.session_id = sid
         self.msgs = self.db.load_messages(sid)
-        self.ctx_used = sum(len(model_text(m)) for m in self.msgs) // 4
+        self.ctx_used = sum(len(model_text(m)) for m in self.msgs) // 4 + 1500 * sum(
+            1 for m in self.msgs for a in m.get("attachments", []) if a.get("kind") == "image")
         self.ctx_exact = False
         self._update_stats()
         self._render()
@@ -766,28 +883,35 @@ class Gadget(QWidget):
         self._refresh_db_status()
 
     # ---------------------------------------------------------------- user / prompt
+    def _prompt_key(self):
+        """users-table key: plain user name for the default profile, user@profile otherwise."""
+        return self.user if self.profile.key == profiles.DEFAULT_PROFILE else f"{self.user}@{self.profile.key}"
+
+    def _load_prompt(self):
+        return self.db.get_prompt(self._prompt_key()) or self.profile.default_prompt
+
     def _apply_user(self):
         name = self.user_edit.text().strip() or DEFAULT_USER
         self.user_edit.setText(name)
         self.user = name
         self.settings.setValue("user", name)
-        self.system_prompt = self.db.get_prompt(name) or DEFAULT_PROMPT
+        self.system_prompt = self._load_prompt()
         self.prompt_edit.setPlainText(self.system_prompt)
         self.prompt_msg.setText(f"Loaded prompt for {name}")
         self.new_session()
         self._refresh_history()
 
     def _save_prompt(self):
-        text = self.prompt_edit.toPlainText().strip() or DEFAULT_PROMPT
-        self.db.set_prompt(self.user, text)
+        text = self.prompt_edit.toPlainText().strip() or self.profile.default_prompt
+        self.db.set_prompt(self._prompt_key(), text)
         self.system_prompt = text
-        self.prompt_msg.setText(f"Saved for {self.user} · {datetime.now():%H:%M:%S}")
+        self.prompt_msg.setText(f"Saved for {self.user} / {self.profile.key} · {datetime.now():%H:%M:%S}")
         self._refresh_db_status()
 
     def _reset_prompt(self):
-        self.db.reset_prompt(self.user)
-        self.system_prompt = DEFAULT_PROMPT
-        self.prompt_edit.setPlainText(DEFAULT_PROMPT)
+        self.db.reset_prompt(self._prompt_key())
+        self.system_prompt = self.profile.default_prompt
+        self.prompt_edit.setPlainText(self.system_prompt)
         self.prompt_msg.setText("Reset to default")
 
     # ---------------------------------------------------------------- database
@@ -807,7 +931,7 @@ class Gadget(QWidget):
             self._refresh_db_status()
             return
         self.settings.setValue("db_path", str(self.db.path))
-        self.system_prompt = self.db.get_prompt(self.user) or DEFAULT_PROMPT
+        self.system_prompt = self._load_prompt()
         self.prompt_edit.setPlainText(self.system_prompt)
         self.new_session()
         self._refresh_history()
