@@ -34,6 +34,7 @@ Switch profiles instantly via the header dropdown:
   - Exact-text response copying: Copy button copies assistant Markdown/code directly to clipboard with brief visual confirmation.
   - Stored-image previews: clickable thumbnails in composer and historical messages open a resizable viewer with fit-to-window and actual-size modes, decoded safely from stored data.
   - Tool inspector: browse available built-in and MCP tools, schemas, and provider statuses.
+  - YOLO mode: optional checkbox to auto-approve all tool calls (file writes, bash, MCP) without prompting.
 - **Gadget mode**: Frameless, translucent background, stays-on-top, draggable. Closing window minimizes to the system tray.
 
 ## Run
@@ -63,8 +64,10 @@ Configure external tools via **Settings → Configure MCP…** or inspect them v
 - Output is bounded to 64 KiB with truncation notices. Default per-call timeout is 60s (configurable between 1–300s).
 
 ### Approvals and session control
-Choose **Deny** or close the approval dialog to refuse a call. Its denial is sent
-back to the agent. **Stop** cancels the turn and terminates any running command or
+By default, file writes, bash commands, and all MCP tool calls show an approval modal. Choose **Deny** or close the dialog to refuse a call. Its denial is sent back to the agent.
+- **YOLO mode**: Check the **YOLO mode** box to automatically approve all tool calls immediately without prompt modals. Use with care as actions execute right away.
+
+**Stop** cancels the turn and terminates any running command or
 MCP call; it does not undo completed side effects. Completed tool exchanges remain
 in history after cancellation or a later model error. Starting a new session or
 opening history waits for the active worker to finish before switching.

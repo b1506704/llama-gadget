@@ -239,3 +239,17 @@ class AppToolsTests(unittest.TestCase):
         self.assertIn('demo_tool', labels_joined)
         self.assertIn('42', approval_seen[0]['preview'][0])
 
+    def test_yolo_mode_auto_approves_without_dialog(self):
+        self.setup_tools()
+        self.app.yolo_cb.setChecked(True)
+        self.server([
+            [chunk(call_delta(name='write_file', arguments='{"path":"yolo_test.txt", "content":"auto approved!"}')),
+             chunk(finish='tool_calls'), '[DONE]'],
+            [chunk({'content': 'Done'}), chunk(finish='stop'), '[DONE]'],
+        ])
+        self.app.input.setPlainText('Write yolo')
+        self.app.send()
+        self.assertTrue(pump_until(lambda: self.app.worker is None))
+        self.assertIsNone(self.app._approval_dialog)
+        self.assertTrue((self.root / 'yolo_test.txt').exists())
+        self.assertEqual((self.root / 'yolo_test.txt').read_text(), 'auto approved!')

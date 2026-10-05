@@ -402,10 +402,18 @@ class Gadget(QWidget):
         tools_row.addWidget(self.workspace_btn)
         tools_row.addWidget(self.tools_btn)
         lay.addLayout(tools_row)
+        options_row = QHBoxLayout()
         self.show_tools_cb = QCheckBox('Show tool details')
         self.show_tools_cb.setChecked(self.settings.value('show_tool_details', False, bool))
         self.show_tools_cb.toggled.connect(self._toggle_tool_details)
-        lay.addWidget(self.show_tools_cb)
+        self.yolo_cb = QCheckBox('YOLO mode')
+        self.yolo_cb.setToolTip('Auto-approve all tool calls (bash commands, file writes, MCP) without prompting')
+        self.yolo_cb.setChecked(self.settings.value('yolo_mode', False, bool))
+        self.yolo_cb.toggled.connect(self._toggle_yolo_mode)
+        options_row.addWidget(self.show_tools_cb)
+        options_row.addWidget(self.yolo_cb)
+        options_row.addStretch()
+        lay.addLayout(options_row)
         self.workspace_lbl = QLabel('Select a workspace to enable tools')
         self.workspace_lbl.setWordWrap(True)
         lay.addWidget(self.workspace_lbl)
@@ -748,6 +756,7 @@ class Gadget(QWidget):
         mcp_tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         eligible = (bool(self.workspace) or bool(mcp_tools)) and self.profile.key in ('agent-gpu0', 'agent-27b')
         self.tools_cb.setEnabled(eligible and self.worker is None)
+        self.yolo_cb.setEnabled(eligible and self.worker is None)
         if not eligible and self.tools_cb.isChecked():
             self.tools_cb.setChecked(False)
         if self.workspace:
@@ -857,6 +866,9 @@ class Gadget(QWidget):
     def _toggle_tool_details(self, show):
         self.settings.setValue('show_tool_details', bool(show))
         self._render()
+
+    def _toggle_yolo_mode(self, on):
+        self.settings.setValue('yolo_mode', bool(on))
 
     def _preview_image(self, attachment):
         try:
@@ -1003,6 +1015,9 @@ class Gadget(QWidget):
     def _request_approval(self, worker, call_id, name, args):
         if self.worker is not worker or worker.cancel_event.is_set() or self._shutting_down:
             worker.decide(call_id, False)
+            return
+        if self.yolo_cb.isChecked():
+            worker.decide(call_id, True)
             return
         dialog = QDialog(self)
         dialog.setStyleSheet('QDialog { background: #14161a; }')
