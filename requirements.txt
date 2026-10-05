@@ -1,1 +1,3 @@
 PyQt6
+mcp>=2.3.0,<3
+jsonschema>=4.23,<5

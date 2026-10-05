@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "local-example": {
+      "command": "python",
+      "args": ["/absolute/path/to/server.py"],
+      "disabled": true
+    },
+    "remote-example": {
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:MCP_TOKEN}"
+      },
+      "disabled": true
+    }
+  }
+}

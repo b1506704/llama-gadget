@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS messages(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     role TEXT NOT NULL, content TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]',
-    ts TEXT NOT NULL);
+    ts TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS clips(
     id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL UNIQUE, ts TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
@@ -44,6 +44,8 @@ class Database:
         try:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(SCHEMA)
+            if 'metadata' not in {row[1] for row in conn.execute('PRAGMA table_info(messages)')}:
+                conn.execute("ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
         except Exception:
             conn.close()
@@ -90,14 +92,33 @@ class Database:
         self.conn.commit()
         return cur.lastrowid
 
-    def add_message(self, sid, role, content, attachments=None, ts=None):
+    def add_message(self, sid, role, content, attachments=None, ts=None, metadata=None):
         ts = ts or now()
         cur = self.conn.execute(
-            "INSERT INTO messages(session_id,role,content,attachments,ts) VALUES(?,?,?,?,?)",
-            (sid, role, content, json.dumps(attachments or []), ts))
+            "INSERT INTO messages(session_id,role,content,attachments,ts,metadata) VALUES(?,?,?,?,?,?)",
+            (sid, role, content, json.dumps(attachments or []), ts, json.dumps(metadata or {})))
         self.conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
         self.conn.commit()
         return cur.lastrowid
+
+    def add_exchange(self, sid, messages):
+        """Save a complete protocol exchange in one transaction on the UI thread."""
+        saved = []
+        with self.conn:
+            for message in messages:
+                ts = message.get('ts') or now()
+                metadata = dict(message.get('metadata', {}))
+                metadata.update({key: message[key] for key in ('tool_calls', 'tool_call_id', 'name')
+                                 if key in message})
+                attachments = message.get('attachments', [])
+                cur = self.conn.execute(
+                    'INSERT INTO messages(session_id,role,content,attachments,ts,metadata) VALUES(?,?,?,?,?,?)',
+                    (sid, message['role'], message['content'], json.dumps(attachments), ts, json.dumps(metadata)))
+                saved.append(dict(id=cur.lastrowid, role=message['role'], content=message['content'],
+                                  attachments=attachments, ts=ts, metadata=metadata))
+            if saved:
+                self.conn.execute('UPDATE sessions SET updated_at=? WHERE id=?', (saved[-1]['ts'], sid))
+        return saved
 
     def delete_message(self, mid):
         self.conn.execute("DELETE FROM messages WHERE id=?", (mid,))
@@ -111,8 +132,9 @@ class Database:
 
     def load_messages(self, sid):
         rows = self.conn.execute(
-            "SELECT id, role, content, attachments, ts FROM messages WHERE session_id=? ORDER BY id", (sid,))
-        return [dict(id=i, role=r, content=c, attachments=json.loads(a), ts=t) for i, r, c, a, t in rows]
+            "SELECT id, role, content, attachments, ts, metadata FROM messages WHERE session_id=? ORDER BY id", (sid,))
+        return [dict(id=i, role=r, content=c, attachments=json.loads(a), ts=t, metadata=json.loads(m))
+                for i, r, c, a, t, m in rows]
 
     def delete_session(self, sid):
         self.conn.execute("DELETE FROM messages WHERE session_id=?", (sid,))

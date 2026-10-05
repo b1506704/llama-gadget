@@ -34,3 +34,18 @@ def encode_image(img: QImage, name: str) -> dict:
 
 def load_image(path) -> dict:
     return encode_image(QImage(str(path)), Path(path).name)
+
+
+def decode_attachment_image(attachment) -> QImage:
+    """Decode the stored image, independent of the original attachment path."""
+    try:
+        prefix, encoded = attachment['data'].split(',', 1)
+        if not prefix.startswith('data:image/') or not prefix.endswith(';base64'):
+            raise ValueError('Unsupported image data URL')
+        raw = base64.b64decode(encoded, validate=True)
+        image = QImage.fromData(raw)
+        if image.isNull():
+            raise ValueError('Image attachment is not readable')
+        return image
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('Image preview is unavailable: invalid stored image data') from exc
