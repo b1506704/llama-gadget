@@ -1,7 +1,8 @@
 """Server profiles the gadget can switch between.
 
 All servers come from the "Image Description GGUF" project (llama.cpp build + start-server.sh):
-  services    - Qwen3.5-9B on GPU1 (RTX 3050), 128K ctx, always-on systemd user unit, :8080
+  services    - Qwen3.5-9B on GPU1 (RTX 3050), 128K ctx, always-on systemd user unit, :8080.
+                Text + image analysis: mmproj runs on CPU so the tier stays inside its VRAM budget.
   agent-gpu0  - Qwen3.5-9B on GPU0 (RTX 5060 Ti), 256K context + --jinja tool calling, :8081.
                 Runs next to `services` (different GPU, different port).
   agent-27b   - Qwen3.8-27B across both GPUs (deep reasoning agent), 128K context, :8080.
@@ -39,8 +40,10 @@ class Profile:
 
 
 PROFILES = {p.key: p for p in (
-    Profile("services", "Services · Qwen3.5-9B 128K · GPU1 (always-on)", 8080, "llama-services.service", "GPU1", False,
-            ("vision", "agent-27b"), "You are a concise, helpful assistant.", managed=True),
+    Profile("services", "Services · Qwen3.5-9B 128K+vision · GPU1 (always-on)", 8080, "llama-services.service", "GPU1", True,
+            ("vision", "agent-27b"),
+            "You are a concise, helpful assistant. When images are attached, examine them carefully "
+            "(content, objects, layout, visible text) and answer precisely.", managed=True),
     Profile("agent-gpu0", f"Agent · Qwen3.5-9B {AGENT_CTX // 1024}K · GPU0", 8081, "llama-agent-gpu0", "GPU0", False,
             ("vision", "agent-27b"),
             "You are an agentic assistant. Work step by step: plan briefly, use the tools you are given, "
