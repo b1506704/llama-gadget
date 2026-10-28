@@ -3,6 +3,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from .adapter import ThemeAdapter
+from .current import set_active_adapter
 from .controller import (SystemAppearance, ThemeController, ThemePreference,
                          appearance_from_color_scheme, detect_system_appearance)
 
@@ -10,8 +11,9 @@ from .controller import (SystemAppearance, ThemeController, ThemePreference,
 class ThemeManager(QObject):
     """Owns the ThemeController, persists preference changes, and restyles the QApplication.
 
-    `theme_changed(ThemeTokens)` is the single hook for widgets that build their own
-    token-derived styles; it fires after the app-wide palette and stylesheet are applied.
+    `theme_changed(ThemeTokens)` is the hook for widgets that build their own token-derived
+    styles; it fires after the app-wide palette and stylesheet are applied and the palette is
+    published to `theme.current` (which refreshes widgets registered with `bind_theme`).
     """
     theme_changed = pyqtSignal(object)
 
@@ -22,6 +24,7 @@ class ThemeManager(QObject):
         self._app = app or QApplication.instance()
         self.controller = ThemeController(store.load_theme_preference(), detector())
         self.adapter = ThemeAdapter(self.controller.active_tokens())
+        set_active_adapter(self.adapter)
         self._app.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
 
     def preference(self) -> ThemePreference:
@@ -36,6 +39,7 @@ class ThemeManager(QObject):
         self.adapter = ThemeAdapter(tokens)
         self._app.setPalette(self.adapter.palette())
         self._app.setStyleSheet(self.adapter.stylesheet())
+        set_active_adapter(self.adapter)
         self.theme_changed.emit(tokens)
         return tokens
 
