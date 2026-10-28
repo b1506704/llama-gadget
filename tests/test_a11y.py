@@ -6,11 +6,16 @@ from unittest.mock import patch
 
 from PyQt6 import sip
 from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QVBoxLayout
+from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QLabel, QLineEdit, QPushButton, QVBoxLayout
 
-from llama_gadget.app import Gadget
+from llama_gadget.a11y import (AccessibleControlMeta, accessibility_gaps, accessible_label, accessible_role,
+                               register_accessible_control)
+from llama_gadget.app import FolderDialog, Gadget
+from llama_gadget.chat_ui import ImagePreviewDialog
+from llama_gadget.images import encode_image
+from llama_gadget.tool_ui import MCPConfigDialog, ToolInspectorDialog
 
 APPLICATION = QApplication.instance() or QApplication([])
 
@@ -165,6 +170,67 @@ class OverlayTrapTests(GadgetCase):
         self.assertIs(trap.handle_tab(middle), last)
         self.assertIs(trap.handle_tab(self.app.send_btn), first)  # background controls are never candidates
         dialog.close()
+
+
+class AccessibleMetadataTests(GadgetCase):
+    def assert_complete(self, root):
+        gaps = accessibility_gaps(root)
+        self.assertEqual(gaps, [], [f'{type(w).__name__}:{w.objectName()}' for w in gaps])
+
+    def test_register_contract(self):
+        button = QPushButton('✕', self.app)
+        meta = register_accessible_control(button, '  Hide to tray ')
+        self.assertEqual(meta, AccessibleControlMeta('hide-to-tray', 'Button', 'Hide to tray'))
+        self.assertEqual(button.accessibleName(), 'Hide to tray')
+        self.assertEqual(button.accessibleIdentifier(), 'hide-to-tray')
+        self.assertEqual(register_accessible_control(QLineEdit(self.app), 'Endpoint', 'endpoint').id, 'endpoint')
+        self.assertEqual(accessible_role(QCheckBox()), 'CheckBox')
+        for bad in ('', '   ', '✕'):
+            with self.assertRaises(ValueError):
+                register_accessible_control(QPushButton(), bad)
+        with self.assertRaises(ValueError):
+            register_accessible_control(QLabel('not interactive'), 'Label')
+
+    def test_every_gadget_control_has_role_and_label(self):
+        self.app.msgs = [{'role': 'user', 'content': 'hi', 'ts': ''},
+                         {'role': 'assistant', 'content': 'hello', 'ts': ''}]
+        self.app._render()
+        self.assert_complete(self.app)
+        self.assertEqual(accessible_label(self.app.edit_ep_btn), 'Edit endpoint URL')
+        self.assertEqual(accessible_label(self.app.input), 'Message')
+        self.assertEqual(accessible_label(self.app.tabs.tabBar()), 'Sections')
+        self.assertEqual(accessible_label(self.app.send_btn), 'Send')  # live button text
+        self.assertEqual(accessible_label(self.app.tools_cb), 'Enable tools')
+        cards = list(self.app.view.cards.values())
+        self.assertEqual([c.body.accessibleName() for c in cards], ['Your message', 'Assistant message'])
+        self.assertEqual(cards[1].copy_btn.accessibleName(), 'Copy response')
+
+    def test_every_dialog_control_has_role_and_label(self):
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor('red'))
+        files = [{'rel': 'a.txt', 'chars': 10, 'truncated': False}]
+        dialogs = [FolderDialog(self.app, '/tmp/x', files, 1, 100), ImagePreviewDialog(encode_image(image, 'p.jpg'), self.app),
+                   MCPConfigDialog(Path(self.temp.name) / 'mcp.json', parent=self.app), ToolInspectorDialog(parent=self.app)]
+        for dialog in dialogs:
+            self.addCleanup(dialog.deleteLater)
+            self.assert_complete(dialog)
+
+    def test_approval_dialog_controls_are_labelled(self):
+        class Worker:
+            cancel_event = __import__('threading').Event()
+            registry = None
+            decide = lambda self, *a: None
+            cancel = lambda self: None
+        worker = Worker()
+        self.app.worker = worker
+        self.addCleanup(setattr, self.app, 'worker', None)
+        self.app.yolo_cb.setChecked(False)
+        self.app._request_approval(worker, 'call_1:1', 'bash_command', {'command': 'ls'})
+        dialog = self.app._approval_dialog
+        self.assert_complete(dialog)
+        names = {b.accessibleName() for b in dialog.findChildren(QPushButton)}
+        self.assertEqual(names, {'Approve bash_command', 'Deny bash_command'})
+        dialog.reject()
 
 
 if __name__ == '__main__':

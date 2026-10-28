@@ -1,7 +1,12 @@
-"""Keyboard focus rings and overlay focus trapping for the gadget and its dialogs."""
+"""Keyboard focus rings, overlay focus trapping, and assistive-technology metadata for the gadget."""
+import re
+from dataclasses import dataclass
+
 from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
-from PyQt6.QtWidgets import QApplication, QDialog, QWidget
+from PyQt6.QtWidgets import (QAbstractButton, QAbstractItemView, QAbstractScrollArea, QAbstractSlider,
+                             QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QLineEdit,
+                             QPlainTextEdit, QRadioButton, QTabBar, QTextEdit, QTreeView, QWidget)
 
 FOCUS_PROPERTY = 'keyboardFocus'
 NAV_KEYS = {Qt.Key.Key_Tab, Qt.Key.Key_Backtab, Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Left,
@@ -152,3 +157,74 @@ class OverlayFocusTrap(QObject):
         if not window.isActiveWindow():
             window.activateWindow()
         target.setFocus(Qt.FocusReason.OtherFocusReason)
+
+
+# Mirrors the roles Qt's built-in accessibility factory reports to AT-SPI/UIA/NSAccessibility for each class
+# (PyQt6 does not bind QAccessible, so this table is what tests and audits can see). Most specific first.
+ROLES = ((QTabBar, 'PageTabList'), (QCheckBox, 'CheckBox'), (QRadioButton, 'RadioButton'),
+         (QAbstractButton, 'Button'), (QComboBox, 'ComboBox'), (QLineEdit, 'EditableText'),
+         (QTextEdit, 'EditableText'), (QPlainTextEdit, 'EditableText'), (QTreeView, 'Tree'),
+         (QAbstractItemView, 'List'), (QAbstractSlider, 'Slider'), (QAbstractSpinBox, 'SpinBox'),
+         (QAbstractScrollArea, 'ScrollArea'), (QDialog, 'Dialog'))
+
+
+@dataclass(frozen=True)
+class AccessibleControlMeta:
+    id: str
+    role: str
+    label: str
+
+
+def accessible_role(widget):
+    return next((role for cls, role in ROLES if isinstance(widget, cls)), None)
+
+
+def accessible_label(widget):
+    """The name assistive technologies receive: the explicit accessible name, else a button's own text."""
+    if widget.accessibleName().strip():
+        return widget.accessibleName().strip()
+    if isinstance(widget, QAbstractButton):
+        return widget.text().replace('&', '').strip()
+    return ''
+
+
+def register_accessible_control(widget, label, identifier=None):
+    """Expose ``widget`` to assistive technologies with a non-empty label and a stable identifier."""
+    label = (label or '').strip()
+    if not re.search(r'\w', label):
+        raise ValueError(f'accessible label must contain readable text, got {label!r}')
+    role = accessible_role(widget)
+    if role is None:
+        raise ValueError(f'{type(widget).__name__} has no accessible role mapping')
+    identifier = identifier or widget.objectName() or re.sub(r'\W+', '-', label.lower()).strip('-')
+    if not widget.objectName():
+        widget.setObjectName(identifier)
+    widget.setAccessibleIdentifier(identifier)
+    widget.setAccessibleName(label)
+    return AccessibleControlMeta(identifier, role, label)
+
+
+def interactive(widget):
+    if widget.focusProxy() is not None:  # e.g. QTabWidget -> its QTabBar, which is checked itself
+        return False
+    return isinstance(widget, QAbstractButton) or bool(widget.focusPolicy() & Qt.FocusPolicy.TabFocus)
+
+
+def label_controls(root):
+    """Give every unlabeled interactive control under ``root`` a label derived from its text or tooltip."""
+    for widget in root.findChildren(QWidget):
+        if not interactive(widget) or widget.window() is not root.window() or widget.accessibleName():
+            continue
+        if isinstance(widget, QAbstractButton) and re.search(r'\w', accessible_label(widget)):
+            continue  # Qt reads the live button text, which stays correct when the text changes
+        text = accessible_label(widget) or widget.toolTip() or getattr(widget, 'placeholderText', str)()
+        text = re.sub(r'\s*\(.*$', '', text.replace('…', '')).strip()  # drop "(Ctrl+…)" hints
+        if re.search(r'\w', text) and accessible_role(widget):
+            register_accessible_control(widget, text)
+
+
+def accessibility_gaps(root):
+    """Interactive controls in ``root``'s window lacking a role or a readable label (for audits and tests)."""
+    return [w for w in [root, *root.findChildren(QWidget)]
+            if interactive(w) and w.window() is root.window()
+            and (accessible_role(w) is None or not re.search(r'\w', accessible_label(w)))]

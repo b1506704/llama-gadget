@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QFileDialog, QWidget
 )
 
+from .a11y import label_controls, register_accessible_control
 from .mcp_config import EXAMPLE, parse_config, save_config, load_config
 from .theme import DARK_TOKENS
 from .tools import DEFINITIONS
@@ -66,6 +67,8 @@ class MCPConfigDialog(QDialog):
         btn_row.addStretch()
         btn_row.addWidget(self.close_btn)
         lay.addLayout(btn_row)
+        register_accessible_control(self.editor, 'MCP servers configuration JSON')
+        label_controls(self)
 
     def _validate(self):
         try:
@@ -173,6 +176,9 @@ class ToolInspectorDialog(QDialog):
         self.close_btn.clicked.connect(self.close)
         bottom_row.addWidget(self.close_btn)
         lay.addLayout(bottom_row)
+        register_accessible_control(self.tree, 'Tools and providers')
+        register_accessible_control(self.detail_view, 'Tool or provider details')
+        label_controls(self)
 
         self.update_snapshot((), {}, workspace=self.workspace)
 

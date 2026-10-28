@@ -9,6 +9,7 @@ from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
 
+from .a11y import label_controls, register_accessible_control
 from .images import decode_attachment_image
 
 
@@ -102,6 +103,8 @@ class ImagePreviewDialog(QDialog):
         self.label = QLabel()
         self.scroll.setWidget(self.label)
         layout.addWidget(self.scroll, 1)
+        register_accessible_control(self.scroll, f"Image preview {attachment.get('name', '')}", 'image-preview')
+        label_controls(self)
         self.update_image()
 
     def update_image(self):
@@ -134,6 +137,7 @@ class MessageCard(QWidget):
         header.addWidget(self.heading, 1)
         self.copy_btn = QPushButton('Copy')
         self.copy_btn.clicked.connect(self.copy_response)
+        register_accessible_control(self.copy_btn, 'Copy response', 'copy-response')
         header.addWidget(self.copy_btn)
         layout.addLayout(header)
         self.body = MarkdownBody()
@@ -160,6 +164,7 @@ class MessageCard(QWidget):
         calls = metadata.get('tool_calls', [])
         heading = {'user': 'You', 'assistant': 'Assistant', 'tool': 'Tool result', 'context': 'Folder context'}.get(role, role)
         self.heading.setText(heading + (' · ' + message['ts'] if message.get('ts') else ''))
+        self.body.setAccessibleName('Your message' if role == 'user' else heading + ' message')
         self.copy_btn.setVisible(role == 'assistant' and bool(content))
         if role == 'tool':
             heading += ': ' + metadata.get('name', 'tool')

@@ -16,7 +16,8 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
-from .a11y import KeyboardFocusTracker, OverlayFocusTrap
+from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, label_controls,
+                   register_accessible_control as name_control)
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
 from .theme import DARK_TOKENS, stylesheet
@@ -156,6 +157,8 @@ class FolderDialog(QDialog):
         row.addWidget(cancel)
         row.addWidget(ok)
         lay.addLayout(row)
+        name_control(self.list, "Files to add")
+        label_controls(self)
         self._update()
 
     def _set_all(self, st):
@@ -282,6 +285,7 @@ class Gadget(QWidget):
         close.setFixedWidth(30)
         close.setToolTip("Hide to tray")
         close.clicked.connect(self.hide)
+        name_control(close, "Hide to tray")
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
@@ -296,6 +300,7 @@ class Gadget(QWidget):
             self.profile_cb.addItem(p.label, p.key)
         self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
         self.profile_cb.currentIndexChanged.connect(self._on_profile)
+        name_control(self.profile_cb, "Profile")
         prow.addWidget(self.profile_cb, 1)
         lay.addLayout(prow)
 
@@ -308,6 +313,7 @@ class Gadget(QWidget):
         self.edit_ep_btn.setFixedSize(26, 26)
         self.edit_ep_btn.setToolTip("Edit endpoint URL")
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
+        name_control(self.edit_ep_btn, "Edit endpoint URL")
         erow.addWidget(self.endpoint_lbl, 1)
         erow.addWidget(self.edit_ep_btn)
         lay.addLayout(erow)
@@ -321,12 +327,14 @@ class Gadget(QWidget):
         self.tabs.addTab(self._history_page(), "History")
         self.tabs.addTab(self._settings_page(), "Settings")
         self.tabs.currentChanged.connect(self._on_tab)
+        name_control(self.tabs.tabBar(), "Sections")
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
         self.db_footer.setProperty("muted", True)
         lay.addWidget(self.db_footer)
         self._update_controls()
+        label_controls(self)
 
     def _chat_page(self):
         w = QWidget()
@@ -335,6 +343,7 @@ class Gadget(QWidget):
 
         self.view = ChatTranscript()
         self.view.image_requested.connect(self._preview_image)
+        name_control(self.view, "Chat transcript")
         lay.addWidget(self.view, 1)
 
         vbar = self.view.verticalScrollBar()
@@ -348,6 +357,7 @@ class Gadget(QWidget):
         self.scroll_bottom_btn.setProperty("accent", True)
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
+        name_control(self.scroll_bottom_btn, "Jump to latest messages")
         self.scroll_bottom_btn.hide()
         srow.addWidget(self.stats_lbl, 1)
         srow.addWidget(self.scroll_bottom_btn)
@@ -373,6 +383,7 @@ class Gadget(QWidget):
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
+        name_control(self.input, "Message")
         lay.addWidget(self.input)
 
         tools_row = QHBoxLayout()
@@ -412,13 +423,16 @@ class Gadget(QWidget):
         if self.profile.vision:
             self.attach_btn.setText("📎 File / 🖼 Image")
         self.attach_btn.clicked.connect(self._pick_files)
+        name_control(self.attach_btn, "Attach files")
         self.folder_btn = QPushButton("📁 Folder")
         self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
                                    "skips binaries/node_modules) — or drop a folder on the window")
         self.folder_btn.clicked.connect(self._pick_folder)
+        name_control(self.folder_btn, "Add folder context")
         self.clip_btn = QPushButton("📋 Clips")
         self.clip_btn.setToolTip("Clipboard memory (Ctrl+Shift+V)")
         self.clip_btn.clicked.connect(self._show_clip_menu)
+        name_control(self.clip_btn, "Clipboard memory")
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send)
         self.stop_btn = QPushButton('Stop')
@@ -441,6 +455,7 @@ class Gadget(QWidget):
         lay.addWidget(self.hist_user_lbl)
         self.hist_list = QListWidget()
         self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
+        name_control(self.hist_list, "Saved sessions")
         lay.addWidget(self.hist_list, 1)
         row = QHBoxLayout()
         for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
@@ -462,12 +477,15 @@ class Gadget(QWidget):
         apply_u = QPushButton("Apply")
         apply_u.clicked.connect(self._apply_user)
         self.user_edit.returnPressed.connect(self._apply_user)
+        name_control(self.user_edit, "User name")
+        name_control(apply_u, "Apply user name")
         urow.addWidget(self.user_edit, 1)
         urow.addWidget(apply_u)
         lay.addLayout(urow)
 
         lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
+        name_control(self.prompt_edit, "System prompt")
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
         prow = QHBoxLayout()
@@ -475,6 +493,7 @@ class Gadget(QWidget):
         save_p.clicked.connect(self._save_prompt)
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
+        name_control(reset_p, "Reset system prompt to default")
         self.prompt_msg = QLabel()
         self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
@@ -490,6 +509,9 @@ class Gadget(QWidget):
         self.endpoint_edit.returnPressed.connect(self._apply_endpoint)
         reset_ep = QPushButton("Reset to default")
         reset_ep.clicked.connect(self._reset_endpoint)
+        name_control(self.endpoint_edit, "Endpoint URL")
+        name_control(apply_ep, "Apply endpoint URL")
+        name_control(reset_ep, "Reset endpoint URL to default")
         erow.addWidget(self.endpoint_edit, 1)
         erow.addWidget(apply_ep)
         erow.addWidget(reset_ep)
@@ -508,6 +530,7 @@ class Gadget(QWidget):
         browse.clicked.connect(self._browse_db)
         default = QPushButton("Use default")
         default.clicked.connect(lambda: self._switch_db(DEFAULT_DB))
+        name_control(default, "Use default database")
         clear_clips = QPushButton("Clear clips")
         clear_clips.clicked.connect(self._clear_clips)
         for b in (browse, default, clear_clips):
@@ -1052,6 +1075,9 @@ class Gadget(QWidget):
         row.addWidget(deny)
         row.addWidget(approve)
         layout.addLayout(row)
+        name_control(preview, "Tool call details")
+        name_control(approve, f"Approve {display_name}")
+        name_control(deny, f"Deny {display_name}")
         self._approval_dialog = dialog
         self.tool_status = f'Waiting for approval: {display_name}'
         self._schedule_render()
