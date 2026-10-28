@@ -27,6 +27,8 @@ from .db import DEFAULT_DB, Database
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
+from .theme import (JsonThemePreferenceStore, ThemeManager, ThemePersistError, ThemePreference,
+                    default_preferences_path)
 
 DEFAULT_USER = socket.gethostname()  # PC name
 COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
@@ -38,25 +40,6 @@ def clean_endpoint(url: str) -> str:
         url = "http://" + url
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
-
-STYLE = """
-QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
-QLabel, QCheckBox { color: #d0d4da; }
-QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
-    border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
-QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
-QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
-QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
-QListWidget::item:selected { background: #2a3140; }
-QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
-QPushButton:hover { background: #363b44; }
-QPushButton:disabled { color: #6b7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { background: #1b1e24; color: #9aa0a8; padding: 5px 12px; border-radius: 6px; margin-right: 3px; }
-QTabBar::tab:selected { background: #2a3140; color: #e6e8eb; }
-QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
-QMenu::item:selected { background: #2a3140; }
-"""
 
 
 def make_icon(color: str) -> QIcon:
@@ -141,7 +124,6 @@ class FolderDialog(QDialog):
     def __init__(self, parent, root, files, total_seen, budget):
         super().__init__(parent)
         self.setWindowTitle(f"Folder context — {Path(root).name}")
-        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
         self.resize(460, 520)
         self.files, self.budget = files, budget
         lay = QVBoxLayout(self)
@@ -244,8 +226,9 @@ class Gadget(QWidget):
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
         self.resize(420, 660)
+        self.theme = ThemeManager(JsonThemePreferenceStore(default_preferences_path()), parent=self)
         self._build_ui()
-        self.setStyleSheet(STYLE)
+        self.theme.apply()
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -529,6 +512,18 @@ class Gadget(QWidget):
             drow.addWidget(b)
         lay.addLayout(drow)
 
+        lay.addWidget(QLabel("<b>Theme</b>"))
+        trow = QHBoxLayout()
+        self.theme_cb = QComboBox()
+        for pref in ThemePreference:
+            self.theme_cb.addItem(pref.value.capitalize(), pref.value)
+        self.theme_cb.setCurrentIndex(self.theme_cb.findData(self.theme.preference().value))
+        self.theme_cb.activated.connect(self._on_theme_selected)
+        self.theme_msg = QLabel()
+        trow.addWidget(self.theme_cb)
+        trow.addWidget(self.theme_msg, 1)
+        lay.addLayout(trow)
+
         lay.addWidget(QLabel("<b>MCP Tools Configuration</b>"))
         mcp_row = QHBoxLayout()
         mcp_btn = QPushButton("Configure MCP…")
@@ -538,6 +533,13 @@ class Gadget(QWidget):
         lay.addLayout(mcp_row)
 
         return w
+
+    def _on_theme_selected(self, index):
+        try:
+            self.theme.set_preference(self.theme_cb.itemData(index))
+            self.theme_msg.clear()
+        except ThemePersistError as e:
+            self.theme_msg.setText(f"Applied, but not saved: {e}")
 
     def _apply_gadget(self, on):
         self.settings.setValue("gadget", on)
