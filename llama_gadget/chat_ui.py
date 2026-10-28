@@ -4,7 +4,7 @@ import json
 import math
 import re
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
@@ -44,6 +44,11 @@ class MarkdownBody(QTextBrowser):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.fit_height()
+
+    def changeEvent(self, event):  # UI zoom changes the stylesheet font; refit the wrapped text
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            self.fit_height()
 
 
 class AttachmentStrip(QWidget):

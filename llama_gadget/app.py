@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
-from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, label_controls,
+from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, UiScaleState, ZoomShortcuts, label_controls,
                    register_accessible_control as name_control)
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
@@ -233,7 +233,9 @@ class Gadget(QWidget):
         self._build_ui()
         pt = QApplication.font().pointSizeF()
         self._base_pt = pt if pt > 0 else 10.0
-        self.setStyleSheet(stylesheet(DARK_TOKENS, base_pt=self._base_pt))
+        self.ui_scale = UiScaleState(self.settings.value("ui_scale", UiScaleState.DEFAULT))
+        self._apply_scale()
+        self.zoom_shortcuts = ZoomShortcuts(self, self.zoom)  # Cmd/Ctrl + = / - / 0
         self.focus_tracker = KeyboardFocusTracker(self)
         self.overlay_trap = OverlayFocusTrap(lambda: self.input, self)
 
@@ -281,8 +283,7 @@ class Gadget(QWidget):
         self.status_lbl = QLabel("offline")
         self.power_btn = QPushButton("Start")
         self.power_btn.clicked.connect(self.toggle_service)
-        close = QPushButton("✕")
-        close.setFixedWidth(30)
+        close = self.close_btn = QPushButton("✕")
         close.setToolTip("Hide to tray")
         close.clicked.connect(self.hide)
         name_control(close, "Hide to tray")
@@ -310,7 +311,6 @@ class Gadget(QWidget):
         self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
-        self.edit_ep_btn.setFixedSize(26, 26)
         self.edit_ep_btn.setToolTip("Edit endpoint URL")
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
         name_control(self.edit_ep_btn, "Edit endpoint URL")
@@ -379,7 +379,6 @@ class Gadget(QWidget):
 
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter send · Ctrl+Shift+V clips)")
-        self.input.setFixedHeight(64)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
@@ -555,6 +554,18 @@ class Gadget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, bool(on))
         self.setWindowFlags(flags)
         self.show()
+
+    def zoom(self, action):
+        self.ui_scale.apply(action)
+        self.settings.setValue("ui_scale", self.ui_scale.scale_factor)
+        self._apply_scale()
+
+    def _apply_scale(self):
+        scale = self.ui_scale.scale_factor
+        self.setStyleSheet(stylesheet(DARK_TOKENS, scale, self._base_pt))
+        self.close_btn.setFixedWidth(round(30 * scale))
+        self.edit_ep_btn.setFixedSize(round(26 * scale), round(26 * scale))
+        self.input.setFixedHeight(round(64 * scale))
 
     def toggle_visible(self):
         if self.isVisible():

@@ -1,6 +1,7 @@
 """Keyboard focus rings, overlay focus trapping, and assistive-technology metadata for the gadget."""
 import re
 from dataclasses import dataclass
+from enum import Enum
 
 from PyQt6 import sip
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
@@ -228,3 +229,61 @@ def accessibility_gaps(root):
     return [w for w in [root, *root.findChildren(QWidget)]
             if interactive(w) and w.window() is root.window()
             and (accessible_role(w) is None or not re.search(r'\w', accessible_label(w)))]
+
+
+class UiScaleAction(Enum):
+    INCREASE = 'increase'
+    DECREASE = 'decrease'
+    RESET = 'reset'
+
+
+class UiScaleState:
+    """Interface/typography zoom factor: 1.0 is the 100% baseline, stepped by 10% within [50%, 200%]."""
+    DEFAULT, STEP, MIN, MAX = 1.0, 0.1, 0.5, 2.0
+
+    def __init__(self, scale_factor=DEFAULT):
+        try:
+            scale_factor = float(scale_factor)
+        except (TypeError, ValueError):
+            scale_factor = self.DEFAULT
+        self.scale_factor = self._clamp(scale_factor)
+
+    def _clamp(self, value):
+        return round(min(self.MAX, max(self.MIN, value)), 2)
+
+    def apply(self, action):
+        if action is UiScaleAction.RESET:
+            self.scale_factor = self.DEFAULT
+        else:
+            step = self.STEP if action is UiScaleAction.INCREASE else -self.STEP
+            self.scale_factor = self._clamp(self.scale_factor + step)
+        return self.scale_factor
+
+
+ZOOM_KEYS = {Qt.Key.Key_Equal: UiScaleAction.INCREASE, Qt.Key.Key_Plus: UiScaleAction.INCREASE,
+             Qt.Key.Key_Minus: UiScaleAction.DECREASE, Qt.Key.Key_0: UiScaleAction.RESET}
+
+
+class ZoomShortcuts(QObject):
+    """Cmd/Ctrl + = / - / 0 anywhere in ``window`` or its dialogs, including while a modal dialog is open.
+
+    An application event filter rather than QShortcut, because Qt suppresses shortcuts owned by a window
+    that a modal dialog is blocking. Shift/keypad are ignored so "+" works on every layout and the numpad.
+    """
+
+    def __init__(self, window, callback):
+        super().__init__(window)
+        self.window, self.callback = window, callback
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.KeyPress or event.key() not in ZOOM_KEYS or not isinstance(obj, QWidget):
+            return False
+        mods = event.modifiers() & ~(Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.KeypadModifier)
+        owner = obj.window()
+        while owner is not None and owner is not self.window:  # isAncestorOf stops at window boundaries
+            owner = owner.parentWidget()
+        if mods != Qt.KeyboardModifier.ControlModifier or owner is None:
+            return False
+        self.callback(ZOOM_KEYS[event.key()])
+        return True

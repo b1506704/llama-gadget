@@ -10,8 +10,8 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QLabel, QLineEdit, QPushButton, QVBoxLayout
 
-from llama_gadget.a11y import (AccessibleControlMeta, accessibility_gaps, accessible_label, accessible_role,
-                               register_accessible_control)
+from llama_gadget.a11y import (AccessibleControlMeta, UiScaleAction, UiScaleState, accessibility_gaps, accessible_label,
+                               accessible_role, register_accessible_control)
 from llama_gadget.app import FolderDialog, Gadget
 from llama_gadget.chat_ui import ImagePreviewDialog
 from llama_gadget.images import encode_image
@@ -230,6 +230,69 @@ class AccessibleMetadataTests(GadgetCase):
         self.assert_complete(dialog)
         names = {b.accessibleName() for b in dialog.findChildren(QPushButton)}
         self.assertEqual(names, {'Approve bash_command', 'Deny bash_command'})
+        dialog.reject()
+
+
+class UiScaleStateTests(unittest.TestCase):
+    def test_default_step_reset_and_bounds(self):
+        state = UiScaleState()
+        self.assertEqual(state.scale_factor, 1.0)
+        self.assertGreater(state.apply(UiScaleAction.INCREASE), 1.0)
+        bigger = state.scale_factor
+        self.assertLess(state.apply(UiScaleAction.DECREASE), bigger)
+        self.assertEqual(state.apply(UiScaleAction.RESET), 1.0)
+        for _ in range(3):
+            state.apply(UiScaleAction.DECREASE)
+        self.assertLess(state.scale_factor, 1.0)
+        self.assertEqual(state.apply(UiScaleAction.RESET), 1.0)
+        for _ in range(40):
+            state.apply(UiScaleAction.INCREASE)
+        self.assertEqual(state.scale_factor, UiScaleState.MAX)
+        for _ in range(40):
+            state.apply(UiScaleAction.DECREASE)
+        self.assertEqual(state.scale_factor, UiScaleState.MIN)
+        self.assertEqual(UiScaleState('garbage').scale_factor, 1.0)
+        self.assertEqual(UiScaleState('9').scale_factor, UiScaleState.MAX)
+
+
+class ZoomShortcutTests(GadgetCase):
+    def press(self, key):
+        QTest.keyClick(QApplication.focusWidget() or self.app, key, Qt.KeyboardModifier.ControlModifier)
+
+    def test_ctrl_plus_minus_zero_scale_interface_and_typography(self):
+        self.app.input.setFocus()
+        base_pt, base_height = self.app.input.font().pointSizeF(), self.app.input.height()
+        self.press(Qt.Key.Key_Equal)
+        self.assertAlmostEqual(self.app.ui_scale.scale_factor, 1.1)
+        self.assertGreater(self.app.input.font().pointSizeF(), base_pt)
+        self.assertGreater(self.app.input.height(), base_height)
+        self.assertEqual(float(self.app.settings.value('ui_scale')), 1.1)
+        self.press(Qt.Key.Key_Plus)
+        self.assertAlmostEqual(self.app.ui_scale.scale_factor, 1.2)
+
+        self.press(Qt.Key.Key_0)
+        self.assertEqual(self.app.ui_scale.scale_factor, 1.0)
+        self.assertAlmostEqual(self.app.input.font().pointSizeF(), base_pt)
+
+        self.press(Qt.Key.Key_Minus)
+        self.assertAlmostEqual(self.app.ui_scale.scale_factor, 0.9)
+        self.assertLess(self.app.send_btn.font().pointSizeF(), base_pt)
+        self.assertLess(self.app.input.height(), base_height)
+        self.press(Qt.Key.Key_0)
+        self.assertEqual(self.app.ui_scale.scale_factor, 1.0)
+        QTest.keyClick(self.app.input, Qt.Key.Key_Plus,
+                       Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.KeypadModifier)
+        self.assertAlmostEqual(self.app.ui_scale.scale_factor, 1.1)
+        QTest.keyClick(self.app.input, Qt.Key.Key_0)  # plain keys still type
+        self.assertEqual(self.app.input.toPlainText(), '0')
+
+    def test_shortcuts_also_scale_open_dialogs(self):
+        dialog, (button,) = self.dialog(('ok',))
+        dialog.open()
+        self.assertTrue(pump_until(dialog.isActiveWindow))
+        base = button.font().pointSizeF()
+        QTest.keyClick(button, Qt.Key.Key_Equal, Qt.KeyboardModifier.ControlModifier)
+        self.assertGreater(button.font().pointSizeF(), base)
         dialog.reject()
 
 
