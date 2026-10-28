@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
 from . import profiles, service
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
+from .theme import DARK_TOKENS, stylesheet
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
@@ -29,7 +30,8 @@ from .files import (UnsupportedFile, build_folder_context, parse_file, read_cand
                     scan_folder)
 
 DEFAULT_USER = socket.gethostname()  # PC name
-COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
+COLORS = {"online": DARK_TOKENS.status_success, "loading": DARK_TOKENS.status_warning,
+          "offline": DARK_TOKENS.status_error}
 
 
 def clean_endpoint(url: str) -> str:
@@ -38,25 +40,6 @@ def clean_endpoint(url: str) -> str:
         url = "http://" + url
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
-
-STYLE = """
-QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
-QLabel, QCheckBox { color: #d0d4da; }
-QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
-    border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
-QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
-QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
-QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
-QListWidget::item:selected { background: #2a3140; }
-QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
-QPushButton:hover { background: #363b44; }
-QPushButton:disabled { color: #6b7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { background: #1b1e24; color: #9aa0a8; padding: 5px 12px; border-radius: 6px; margin-right: 3px; }
-QTabBar::tab:selected { background: #2a3140; color: #e6e8eb; }
-QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
-QMenu::item:selected { background: #2a3140; }
-"""
 
 
 def make_icon(color: str) -> QIcon:
@@ -141,7 +124,6 @@ class FolderDialog(QDialog):
     def __init__(self, parent, root, files, total_seen, budget):
         super().__init__(parent)
         self.setWindowTitle(f"Folder context — {Path(root).name}")
-        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
         self.resize(460, 520)
         self.files, self.budget = files, budget
         lay = QVBoxLayout(self)
@@ -189,7 +171,7 @@ class FolderDialog(QDialog):
         sel = self.selected()
         chars = sum(f["chars"] for f in sel)
         over = chars > self.budget
-        color = "#f85149" if over else "#3fb950"
+        color = DARK_TOKENS.status_error if over else DARK_TOKENS.status_success
         self.info.setText(
             f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
             f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
@@ -245,7 +227,9 @@ class Gadget(QWidget):
         self.setAcceptDrops(True)
         self.resize(420, 660)
         self._build_ui()
-        self.setStyleSheet(STYLE)
+        pt = QApplication.font().pointSizeF()
+        self._base_pt = pt if pt > 0 else 10.0
+        self.setStyleSheet(stylesheet(DARK_TOKENS, base_pt=self._base_pt))
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -315,7 +299,7 @@ class Gadget(QWidget):
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
         self.edit_ep_btn.setFixedSize(26, 26)
@@ -337,7 +321,7 @@ class Gadget(QWidget):
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
-        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.db_footer.setProperty("muted", True)
         lay.addWidget(self.db_footer)
         self._update_controls()
 
@@ -356,11 +340,9 @@ class Gadget(QWidget):
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
-        self.stats_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.stats_lbl.setProperty("muted", True)
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
-        self.scroll_bottom_btn.setStyleSheet(
-            "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
-            "padding: 2px 8px; font-size: 11px;")
+        self.scroll_bottom_btn.setProperty("accent", True)
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
         self.scroll_bottom_btn.hide()
@@ -369,7 +351,7 @@ class Gadget(QWidget):
         lay.addLayout(srow)
 
         self.gpu_lbl = QLabel("GPU: …")
-        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.gpu_lbl.setProperty("muted", True)
         lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = AttachmentStrip()
@@ -491,7 +473,7 @@ class Gadget(QWidget):
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
         self.prompt_msg = QLabel()
-        self.prompt_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
         prow.addWidget(reset_p)
         prow.addWidget(self.prompt_msg, 1)
@@ -510,7 +492,7 @@ class Gadget(QWidget):
         erow.addWidget(reset_ep)
         lay.addLayout(erow)
         self.endpoint_msg = QLabel()
-        self.endpoint_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_msg.setProperty("muted", True)
         lay.addWidget(self.endpoint_msg)
 
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
@@ -1020,7 +1002,6 @@ class Gadget(QWidget):
             worker.decide(call_id, True)
             return
         dialog = QDialog(self)
-        dialog.setStyleSheet('QDialog { background: #14161a; }')
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.resize(620, 420)
         layout = QVBoxLayout(dialog)
@@ -1418,13 +1399,13 @@ class Gadget(QWidget):
         if st["ok"]:
             kb = st["size"] / 1024
             size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
-            html = (f'<span style="color:#3fb950">● Connected</span> · integrity {st["integrity"]} · writable<br>'
+            html = (f'<span style="color:{DARK_TOKENS.status_success}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
                     f'{escape(st["path"])}<br>{size} · {st["sessions"]} sessions · '
                     f'{st["messages"]} messages · {st["clips"]} clips')
             self.db_footer.setText(f"DB ● {name} · {st['sessions']} sessions · {st['messages']} msgs")
         else:
             reason = st.get("error") or ("read-only" if not st.get("writable", True) else st.get("integrity"))
-            html = f'<span style="color:#f85149">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
+            html = f'<span style="color:{DARK_TOKENS.status_error}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
             self.db_footer.setText(f"DB ✕ {name}")
         self.db_status.setText(html)
         self.db_footer.setToolTip(st["path"])

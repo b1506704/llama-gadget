@@ -89,7 +89,6 @@ class ImagePreviewDialog(QDialog):
         super().__init__(parent)
         self.image = decode_attachment_image(attachment)
         self.setWindowTitle(attachment.get('name', 'Image preview'))
-        self.setStyleSheet('QDialog { background: #14161a; } QLabel, QCheckBox { color: #d0d4da; }')
         self.resize(800, 600)
         layout = QVBoxLayout(self)
         label = QLabel(f"{attachment.get('name', 'Image')} · {self.image.width()}×{self.image.height()}")
@@ -189,7 +188,6 @@ class ChatTranscript(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
-        self.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: #1b1e24; }')
         container = QWidget()
         self.column = QVBoxLayout(container)
         self.column.setContentsMargins(4, 4, 4, 4)
