@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
+from .a11y import KeyboardFocusTracker, OverlayFocusTrap
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
 from .theme import DARK_TOKENS, stylesheet
@@ -230,6 +231,8 @@ class Gadget(QWidget):
         pt = QApplication.font().pointSizeF()
         self._base_pt = pt if pt > 0 else 10.0
         self.setStyleSheet(stylesheet(DARK_TOKENS, base_pt=self._base_pt))
+        self.focus_tracker = KeyboardFocusTracker(self)
+        self.overlay_trap = OverlayFocusTrap(lambda: self.input, self)
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
