@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import (
     QSplitter, QFileDialog, QWidget
 )
 
+from .chat_ui import LifecycleStatusBar, SkeletonPlaceholder
+from .lifecycle import SurfaceLifecycleController, SurfaceState
 from .mcp_config import EXAMPLE, parse_config, save_config, load_config
 from .tools import DEFINITIONS
 
@@ -144,13 +146,42 @@ class ToolInspectorDialog(QDialog):
         top_row.addWidget(self.disconnect_btn)
         lay.addLayout(top_row)
 
+        # Provider catalog lifecycle (Loading while Connect / Refresh / Disconnect runs).
+        self.lifecycle = SurfaceLifecycleController(self)
+        self.provider_status = LifecycleStatusBar("Providers")
+        self.provider_status.bind(self.lifecycle)
+        lay.addWidget(self.provider_status)
+
+        # Active chat turn (shared controller from the main window) with its own Stop.
+        turn_row = QHBoxLayout()
+        self.turn_status = LifecycleStatusBar("Turn")
+        self.turn_activity = QLabel()
+        self.turn_activity.setTextFormat(Qt.TextFormat.PlainText)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setToolTip("Stop the active turn (completed tool results are kept)")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_turn)
+        turn_row.addWidget(self.turn_status)
+        turn_row.addWidget(self.turn_activity, 1)
+        turn_row.addWidget(self.stop_btn)
+        lay.addLayout(turn_row)
+        self.turn_controller = None
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
+        left_widget = QWidget()
+        left_lay = QVBoxLayout(left_widget)
+        left_lay.setContentsMargins(0, 0, 0, 0)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Tools & Providers", "Status / Type"])
         self.tree.setColumnWidth(0, 200)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection)
-        splitter.addWidget(self.tree)
+        self.skeleton = SkeletonPlaceholder(lines=6)
+        left_lay.addWidget(self.tree, 1)
+        left_lay.addWidget(self.skeleton)
+        left_lay.addStretch()
+        splitter.addWidget(left_widget)
+        self.lifecycle.state_changed.connect(self._on_provider_state)
 
         right_widget = QWidget()
         right_lay = QVBoxLayout(right_widget)
@@ -178,6 +209,45 @@ class ToolInspectorDialog(QDialog):
     def set_active_turn(self, active: bool):
         self.refresh_btn.setEnabled(not active)
         self.disconnect_btn.setEnabled(not active)
+
+    def bind_turn(self, controller):
+        """Mirror the main window's turn lifecycle here; Stop cancels it."""
+        if self.turn_controller is not None:
+            self.turn_controller.state_changed.disconnect(self._on_turn_state)
+        self.turn_controller = controller
+        self.turn_status.bind(controller)
+        controller.state_changed.connect(self._on_turn_state)
+        self._on_turn_state(controller.state)
+
+    def _on_turn_state(self, state):
+        active = state in (SurfaceState.LOADING, SurfaceState.STREAMING)
+        self.stop_btn.setEnabled(active)
+        if not active:
+            self.turn_activity.clear()
+
+    def _stop_turn(self):
+        if self.turn_controller is not None:
+            self.turn_controller.cancel_active()
+
+    def set_turn_activity(self, text):
+        self.turn_activity.setText(text)
+
+    def begin_provider_refresh(self):
+        """Connect / Refresh / Disconnect started: skeleton replaces the tree until the snapshot arrives."""
+        return self.lifecycle.start_operation()
+
+    def fail_provider_refresh(self):
+        self.lifecycle.fail()
+
+    def _on_provider_state(self, state):
+        loading = state is SurfaceState.LOADING
+        self.skeleton.setVisible(loading)
+        self.tree.setVisible(not loading)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.provider_status.refresh()  # show the latest progress when re-opened
+        self.turn_status.refresh()
 
     def update_snapshot(self, tools=(), statuses=(), workspace=None):
         if workspace is not None:
@@ -209,6 +279,7 @@ class ToolInspectorDialog(QDialog):
             status_text = st.get("status", "configured")
             item = QTreeWidgetItem(providers_root, [name, status_text])
             item.setData(0, Qt.ItemDataRole.UserRole, {"type": "provider", "name": name, "status": st})
+        self.lifecycle.complete()  # content is ready: skeleton gives way to the tree
 
     def _on_tree_selection(self):
         items = self.tree.selectedItems()

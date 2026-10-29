@@ -16,7 +16,9 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
 
 from . import profiles, service
 from .chat import ChatWorker
-from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog, TokenFrameCoalescer
+from .chat_ui import (ChatTranscript, AttachmentStrip, ImagePreviewDialog, LifecycleStatusBar,
+                      TokenFrameCoalescer, install_cancel_shortcut)
+from .lifecycle import SurfaceLifecycleController, SurfaceState
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
@@ -215,7 +217,12 @@ class Gadget(QWidget):
         self.last_speed = ""
         self.last_error = ""
         self.reply = ""
-        self._ntok = 0
+        # One lifecycle controller drives the chat transcript and the tool inspector.
+        self.lifecycle = SurfaceLifecycleController(self)
+        self._turn_token = None
+        self._cancel_partial = None
+        self._model_starting = False
+        self._mcp_future = None
         self._render_pending = False
         self._follow_tail = True
         self._drag = None
@@ -239,6 +246,9 @@ class Gadget(QWidget):
         self.resize(420, 660)
         self._build_ui()
         self.setStyleSheet(STYLE)
+        self.lifecycle.state_changed.connect(self._on_lifecycle_state)
+        # Esc cancels the active turn; an open popup / modal overlay is closed first instead.
+        self.cancel_shortcut = install_cancel_shortcut(self, self.stop_turn)
 
         # Blocking systemctl / HTTP / nvidia-smi calls run on background QThreads.
         self.jobs = WorkerQueue(self)
@@ -345,6 +355,10 @@ class Gadget(QWidget):
         vbar = self.view.verticalScrollBar()
         vbar.valueChanged.connect(self._on_scroll)
         vbar.sliderReleased.connect(self._schedule_render)
+
+        self.chat_status = LifecycleStatusBar()
+        self.chat_status.bind(self.lifecycle)
+        lay.addWidget(self.chat_status)
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
@@ -655,6 +669,15 @@ class Gadget(QWidget):
             f"GPU{g['index']} {g['name']}: {g['util']}% · {g['used']}/{g['total']} MiB · {g['temp']}°C"
             for g in gpus) or "GPU: n/a")
 
+    def _model_initializing(self):
+        return self.state == "loading" or self._model_starting
+
+    def _sync_skeleton(self):
+        # Placeholders stand in for the pending reply (turn Loading) or the empty
+        # transcript while the model itself is still starting.
+        self.view.set_skeleton(self.lifecycle.state is SurfaceState.LOADING
+                               or (not self.msgs and self._model_initializing()))
+
     def _set_status(self, s):
         self.state = s
         self.dot.setStyleSheet(f"color: {COLORS[s]}; font-size: 16px;")
@@ -665,6 +688,7 @@ class Gadget(QWidget):
         self.tray_toggle.setText("Stop service" if s != "offline" else "Start service")
         self.power_btn.setEnabled(not self._busy_toggle)
         self._update_controls()
+        self._sync_skeleton()
 
     def _on_profile(self, _i):
         key = self.profile_cb.currentData()
@@ -696,6 +720,7 @@ class Gadget(QWidget):
         prof = self.profile
         want_stop = self.state != "offline"
         self._busy_toggle = True
+        self._model_starting = not want_stop
         self.power_btn.setEnabled(False)
         self.status_lbl.setText("stopping…" if want_stop else "starting…")
         if want_stop:
@@ -745,6 +770,7 @@ class Gadget(QWidget):
 
     def _toggle_done(self, prof, status, err):
         self._busy_toggle = False
+        self._model_starting = False
         self._set_status(status or self.state)
         if err:
             QMessageBox.warning(self, 'Profile error', f"{prof.label}: {err}")
@@ -767,7 +793,7 @@ class Gadget(QWidget):
 
     def _update_controls(self):
         self.send_btn.setEnabled(self.state == "online" and self.worker is None)
-        self.stop_btn.setEnabled(self.worker is not None)
+        self.stop_btn.setEnabled(self.lifecycle.is_active())
         self.workspace_btn.setEnabled(self.worker is None)
         mcp_tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         eligible = (bool(self.workspace) or bool(mcp_tools)) and self.profile.key in ('agent-gpu0', 'agent-27b')
@@ -797,22 +823,29 @@ class Gadget(QWidget):
             return
         manager = self._ensure_mcp_manager()
         config = load_config(self.mcp_config_path)
-        future = manager.connect(config)
-        future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
+        self._track_mcp(manager.connect(config))
 
     def _on_mcp_disconnect(self):
         if self.worker is not None or not self.mcp_manager:
             return
-        future = self.mcp_manager.disconnect()
-        future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
+        self._track_mcp(self.mcp_manager.disconnect())
 
     def _on_mcp_config_saved(self, config):
         if self.worker is None and self.mcp_manager:
-            future = self.mcp_manager.disconnect()
-            future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
+            self._track_mcp(self.mcp_manager.disconnect())
+
+    def _track_mcp(self, future):
+        """The inspector shows Loading (skeleton) until this provider operation settles."""
+        self._mcp_future = future
+        if self._tools_inspector_dialog is not None:
+            self._tools_inspector_dialog.begin_provider_refresh()
+        future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
 
     def _on_mcp_snapshot_updated(self):
         if self._tools_inspector_dialog is not None:
+            future = self._mcp_future
+            if future is not None and future.done() and (future.cancelled() or future.exception() is not None):
+                self._tools_inspector_dialog.fail_provider_refresh()
             tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
             statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
             self._tools_inspector_dialog.update_snapshot(tools, statuses, workspace=self.workspace)
@@ -823,6 +856,7 @@ class Gadget(QWidget):
             self._tools_inspector_dialog = ToolInspectorDialog(workspace=self.workspace, parent=self)
             self._tools_inspector_dialog.refresh_requested.connect(self._on_mcp_refresh)
             self._tools_inspector_dialog.disconnect_requested.connect(self._on_mcp_disconnect)
+            self._tools_inspector_dialog.bind_turn(self.lifecycle)
         self._tools_inspector_dialog.set_active_turn(self.worker is not None)
         tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
@@ -860,8 +894,13 @@ class Gadget(QWidget):
         prev_max = bar.maximum()
         stick = (prev_val >= prev_max - 48) if prev_max > 0 else True
 
+        # While Loading the skeleton stands in for the pending reply; after a cancel the
+        # winding-down worker shows no activity, only the preserved partial reply.
+        active = self.worker is not None and self.lifecycle.is_active()
+        streaming = self.lifecycle.state is SurfaceState.STREAMING
+        self._sync_skeleton()
         self.view.set_messages(self.msgs, live_reply=self.reply if self.worker else '',
-                               activity=(self.tool_status or '…') if self.worker else '',
+                               activity=(self.tool_status or ('…' if streaming else '')) if active else '',
                                error=self.last_error, show_tools=self.show_tools_cb.isChecked())
 
         if stick:
@@ -976,7 +1015,6 @@ class Gadget(QWidget):
         self._clear_attachments()
         self.last_error = ""
         self.reply = ""
-        self._ntok = 0
         self.last_speed = ""
         self.tool_status = ''
         self._turn_has_exchange = False
@@ -985,6 +1023,9 @@ class Gadget(QWidget):
         worker = ChatWorker(payload, base_url=self.current_base_url(), parent=self, registry=registry)
         self.worker = worker
         self._workers.add(worker)
+        self._cancel_partial = None
+        self._turn_token = self.lifecycle.start_operation()  # Idle/Error -> Loading
+        self._turn_token.register_on_cancel(lambda: self._detach_turn(worker))
         # Signals from a retired turn must never modify another session.
         def connect(signal, callback):
             signal.connect(lambda *args: callback(*args) if self.worker is worker else None)
@@ -1087,7 +1128,7 @@ class Gadget(QWidget):
         row.addWidget(approve)
         layout.addLayout(row)
         self._approval_dialog = dialog
-        self.tool_status = f'Waiting for approval: {display_name}'
+        self._set_tool_status(f'Waiting for approval: {display_name}')
         self._schedule_render()
         def decided(result):
             if self._approval_dialog is dialog:
@@ -1097,9 +1138,17 @@ class Gadget(QWidget):
         dialog.finished.connect(decided)
         dialog.open()
 
+    def _set_tool_status(self, text):
+        self.tool_status = text
+        if self._tools_inspector_dialog is not None:
+            self._tools_inspector_dialog.set_turn_activity(text)
+
     def _on_tool_started(self, call_id, name):
-        self.tool_status = f'Running {name}…'
+        self._set_tool_status(f'Running {name}…')
         self._schedule_render()
+
+    def _turn_detached(self):
+        return self._turn_token is not None and self._turn_token.is_cancelled()
 
     def _on_exchange(self, exchange):
         self.token_coalescer.stop()
@@ -1114,11 +1163,16 @@ class Gadget(QWidget):
                 self.msgs.append(dict(role=message['role'], content=message['content'], metadata=metadata,
                                       attachments=[], ts=time.strftime('%Y-%m-%d %H:%M:%S')))
             self.stop_turn()
+        # Completed tool side effects are kept even after Stop; the exchange's assistant
+        # message already carries the streamed text, so there is no separate partial.
+        self._cancel_partial = None
         self.reply = ''
-        self.tool_status = 'Waiting for the next response…'
+        self._set_tool_status('' if self._turn_detached() else 'Waiting for the next response…')
         self._schedule_render()
 
     def _on_message(self, message):
+        if self._turn_detached():
+            return  # stopped: the partial reply on screen is what gets kept
         self.token_coalescer.stop()
         try:
             self.msgs.extend(self.db.add_exchange(self.session_id, [message]))
@@ -1129,17 +1183,18 @@ class Gadget(QWidget):
         self.reply = ''
 
     def _on_token(self, t):
+        if self._turn_detached():
+            return  # trailing tokens from a winding-down worker are never rendered
         self.token_coalescer.enqueue(t)
-        self._ntok += 1
-        if self._ntok == 1:
-            self._t0 = time.monotonic()
-        elif self._ntok % 5 == 0:
-            self.last_speed = f"Gen: {(self._ntok - 1) / max(time.monotonic() - self._t0, 1e-6):.1f} tok/s (live)"
-            self._update_stats()
+        self.lifecycle.record_tokens(1)
 
     def _on_token_frame(self, text):
         # One incremental append and at most one scroll pass per 16ms frame. Auto-scroll
         # only follows when the user is already at the bottom (scrolling up pauses it).
+        if self._turn_detached():
+            return
+        self.lifecycle.mark_streaming()  # first frame: skeleton gives way to the live reply
+        self._update_telemetry()
         self.reply += text
         bar = self.view.verticalScrollBar()
         if not self.view.append_live(text):
@@ -1147,8 +1202,18 @@ class Gadget(QWidget):
         elif self._follow_tail and not bar.isSliderDown():
             bar.setValue(bar.maximum())
 
+    def _update_telemetry(self):
+        """Refresh tokens/s once per frame tick rather than per token signal."""
+        telemetry = self.lifecycle.telemetry
+        self.chat_status.refresh()
+        if telemetry.tokens > 1:
+            self.last_speed = f"Gen: {telemetry.tokens_per_sec:.1f} tok/s (live)"
+            self._update_stats()
+
     def _finish(self):
-        self.tool_status = ''
+        self._commit_partial()
+        self.lifecycle.complete()  # no-op after cancel (Idle) or failure (Error)
+        self._set_tool_status('')
         self._update_controls()
         self._render()
         self._refresh_history()
@@ -1159,6 +1224,7 @@ class Gadget(QWidget):
 
     def _on_fail(self, err):
         self.token_coalescer.stop()
+        self.lifecycle.fail()  # Loading|Streaming -> Error; inline recovery hooks in here
         self.last_error = err
         if not self._turn_has_exchange and self.msgs and self.msgs[-1]['role'] == 'user':
             last = self.msgs.pop()
@@ -1170,18 +1236,46 @@ class Gadget(QWidget):
         self._finish()
 
     def _on_cancelled(self):
-        self.token_coalescer.stop()
+        self.token_coalescer.discard()
         if not self.last_error:
             self.last_error = 'Turn stopped. Completed tool results were kept.'
         self.reply = ''
         self._finish()
 
     def stop_turn(self):
+        """Stop button / Esc: detach the stream and return to Idle within this frame. The
+        worker winds down in the background; completed side effects are never undone."""
+        self.lifecycle.cancel_active()
         if self.worker:
             self.worker.cancel()
-            self.stop_btn.setEnabled(False)
         if self._approval_dialog:
             self._approval_dialog.reject()
+
+    def _detach_turn(self, worker):
+        # Runs synchronously inside CancellationToken.cancel() on the GUI thread.
+        self.token_coalescer.discard()
+        self._cancel_partial = self.reply  # exactly what is already rendered
+        worker.cancel()
+        self.tool_status = ''
+        if self._approval_dialog:
+            self._approval_dialog.reject()
+
+    def _commit_partial(self):
+        """Keep a stopped reply in the conversation (and history) as it was rendered."""
+        partial, self._cancel_partial = self._cancel_partial, None
+        if not partial:
+            return
+        message = dict(role='assistant', content=partial)
+        try:
+            self.msgs.extend(self.db.add_exchange(self.session_id, [message]))
+        except Exception as exc:  # UI persistence boundary
+            self.last_error = f'Could not save partial answer: {exc}'
+            self.msgs.append(dict(message, attachments=[], metadata={}, ts=time.strftime('%Y-%m-%d %H:%M:%S')))
+        self.reply = ''
+
+    def _on_lifecycle_state(self):
+        self.stop_btn.setEnabled(self.lifecycle.is_active())
+        self._sync_skeleton()
 
     def _thread_finished(self, worker):
         self._workers.discard(worker)
@@ -1219,6 +1313,7 @@ class Gadget(QWidget):
         self.msgs, self.session_id = [], None
         self.reply, self.tool_status = '', ''
         self.ctx_used, self.ctx_exact, self.last_speed, self.last_error = 0, True, "", ""
+        self.lifecycle.dismiss_error()  # Error -> Idle
         self._update_controls()
         self._update_stats()
         self._render()
@@ -1330,7 +1425,13 @@ class Gadget(QWidget):
 
     # ---------------------------------------------------------------- history
     def _on_tab(self, i):
-        if i == 1:
+        if i == 0:
+            # The turn kept running while another view was shown: show its latest progress.
+            self.chat_status.refresh()
+            bar = self.view.verticalScrollBar()
+            if self.worker is not None and self._follow_tail:
+                bar.setValue(bar.maximum())
+        elif i == 1:
             self._refresh_history()
         elif i == 2:
             self._refresh_db_status()

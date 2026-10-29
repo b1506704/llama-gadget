@@ -5,11 +5,13 @@ import math
 import re
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap, QTextCursor
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel,
+from PyQt6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcut, QTextCursor
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar,
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
 
 from .images import decode_attachment_image
+from .lifecycle import SurfaceState
+from .theme import TOKENS
 
 
 def code_block(text):
@@ -49,6 +51,137 @@ class TokenFrameCoalescer(QObject):
     def stop(self) -> None:
         """Drain anything still buffered (stream completion), then leave the timer idle."""
         self.flush()
+
+    def discard(self) -> None:
+        """Drop buffered chunks without rendering them (cancellation keeps only what is on screen)."""
+        self.timer.stop()
+        self._chunks = []
+
+
+class LifecycleBadge(QLabel):
+    """Pill showing a surface's SurfaceState in its semantic theme colour."""
+
+    def __init__(self, parent=None, tokens=TOKENS):
+        super().__init__(parent)
+        self.tokens = tokens
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.set_state(SurfaceState.IDLE)
+
+    def set_state(self, state: SurfaceState) -> None:
+        self.state = state
+        color, t = self.tokens.state_color(state), self.tokens
+        self.setText(state.value)
+        self.setStyleSheet(f'color: {color}; border: 1px solid {color}; border-radius: {t.radius}px; '
+                           f'padding: 0 {2 * t.spacing}px; font-size: {t.font_small}px; background: {t.surface_raised};')
+
+
+class SkeletonPlaceholder(QWidget):
+    """Placeholder bars shown in place of an empty pane until its content is ready."""
+
+    def __init__(self, lines=3, parent=None, tokens=TOKENS):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(tokens.spacing, 2 * tokens.spacing, tokens.spacing, 2 * tokens.spacing)
+        layout.setSpacing(2 * tokens.spacing)
+        self.bars = []
+        for index in range(lines):
+            bar = QFrame()
+            bar.setObjectName('skeletonBar')
+            bar.setFixedHeight(12)
+            bar.setStyleSheet(f'QFrame#skeletonBar {{ background: {tokens.skeleton}; border-radius: {tokens.radius}px; }}')
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(bar, 4 - index % 3)  # staggered widths read as text lines
+            row.addStretch(1 + index % 3)
+            layout.addLayout(row)
+            self.bars.append(bar)
+        self.setToolTip('Loading…')
+        self.hide()
+
+
+class StreamProgressIndicator(QWidget):
+    """Busy bar plus live tokens/s; only visible while a surface is Streaming."""
+
+    def __init__(self, parent=None, tokens=TOKENS):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedSize(60, 6)
+        self.bar.setStyleSheet(f'QProgressBar {{ background: {tokens.border}; border: none; border-radius: 3px; }} '
+                               f'QProgressBar::chunk {{ background: {tokens.streaming}; border-radius: 3px; }}')
+        self.rate_lbl = QLabel()
+        self.rate_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self.rate_lbl.setStyleSheet(f'color: {tokens.text_muted}; font-size: {tokens.font_small}px;')
+        layout.addWidget(self.bar)
+        layout.addWidget(self.rate_lbl)
+        self.set_active(False)
+
+    def set_active(self, active: bool) -> None:
+        self.bar.setRange(0, 0 if active else 1)  # 0..0 is Qt's indeterminate (animated) mode
+        self.setVisible(active)
+
+    def update_telemetry(self, telemetry) -> None:
+        self.rate_lbl.setText(f'{telemetry.tokens_per_sec:.1f} tok/s · {telemetry.tokens:,} tok')
+
+
+class LifecycleStatusBar(QWidget):
+    """Badge + streaming indicator bound to a SurfaceLifecycleController."""
+
+    def __init__(self, label='', parent=None, tokens=TOKENS):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        if label:
+            caption = QLabel(label)
+            caption.setStyleSheet(f'color: {tokens.text_muted}; font-size: {tokens.font_small}px;')
+            layout.addWidget(caption)
+        self.badge = LifecycleBadge(tokens=tokens)
+        self.progress = StreamProgressIndicator(tokens=tokens)
+        layout.addWidget(self.badge)
+        layout.addWidget(self.progress)
+        layout.addStretch()
+        self.controller = None
+
+    def bind(self, controller) -> None:
+        if self.controller is not None:
+            self.controller.state_changed.disconnect(self.set_state)
+        self.controller = controller
+        controller.state_changed.connect(self.set_state)
+        self.refresh()
+
+    def set_state(self, state: SurfaceState) -> None:
+        self.badge.set_state(state)
+        self.progress.set_active(state is SurfaceState.STREAMING)
+        if state is SurfaceState.STREAMING and self.controller is not None:
+            self.progress.update_telemetry(self.controller.telemetry)
+
+    def refresh(self) -> None:
+        """Re-read state and telemetry (called on the frame tick and when a view is re-shown)."""
+        if self.controller is None:
+            return
+        if self.badge.state is not self.controller.state:
+            self.set_state(self.controller.state)
+        if self.controller.state is SurfaceState.STREAMING:
+            self.progress.update_telemetry(self.controller.telemetry)
+
+
+def install_cancel_shortcut(surface: QWidget, cancel) -> QShortcut:
+    """Bind Esc in ``surface``'s window to ``cancel``. An open popup or modal overlay is
+    closed first instead, so Esc never stops generation while an overlay is up."""
+    shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), surface)
+    shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+
+    def on_escape():
+        overlay = QApplication.activePopupWidget() or QApplication.activeModalWidget()
+        if overlay is not None and overlay is not surface.window():
+            overlay.close()
+            return
+        cancel()
+    shortcut.activated.connect(on_escape)
+    return shortcut
 
 
 class MarkdownBody(QTextBrowser):
@@ -242,9 +375,19 @@ class ChatTranscript(QScrollArea):
         container = QWidget()
         self.column = QVBoxLayout(container)
         self.column.setContentsMargins(4, 4, 4, 4)
+        self.skeleton = SkeletonPlaceholder()
+        self.column.addWidget(self.skeleton)  # always after the cards, before the stretch
         self.column.addStretch()
         self.setWidget(container)
         self.cards = {}
+        self._skeleton = False
+
+    def set_skeleton(self, visible: bool) -> None:
+        """Show placeholder bars in place of the pending/empty content while initializing."""
+        self._skeleton = bool(visible)
+        self.skeleton.setVisible(self._skeleton)
+        if 'empty' in self.cards:
+            self.cards['empty'].setVisible(not self._skeleton)
 
     def set_messages(self, messages, live_reply='', activity='', error='', show_tools=False):
         visible = []
@@ -281,6 +424,8 @@ class ChatTranscript(QScrollArea):
                 self.column.removeWidget(card)
                 self.column.insertWidget(index, card)
             card.update_message(message, show_tools)
+        if 'empty' in self.cards:
+            self.cards['empty'].setVisible(not self._skeleton)
         self.column.activate()
 
     def append_live(self, text):
@@ -296,5 +441,5 @@ class ChatTranscript(QScrollArea):
         return True
 
     def toPlainText(self):
-        return '\n\n'.join(self.column.itemAt(i).widget().body.toPlainText()
-                            for i in range(self.column.count()-1))
+        widgets = (self.column.itemAt(i).widget() for i in range(self.column.count()))
+        return '\n\n'.join(w.body.toPlainText() for w in widgets if isinstance(w, MessageCard))
