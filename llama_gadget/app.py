@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QMessageBox, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
                              QTextEdit, QVBoxLayout, QWidget)
 
-from . import profiles, service
+from . import profiles, service, theme
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
 from .tools import ToolRegistry
@@ -24,6 +24,7 @@ from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
+from .shortcuts import ActionRegistry, register_primary_actions
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
@@ -39,24 +40,7 @@ def clean_endpoint(url: str) -> str:
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
 
-STYLE = """
-QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
-QLabel, QCheckBox { color: #d0d4da; }
-QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
-    border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
-QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
-QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
-QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
-QListWidget::item:selected { background: #2a3140; }
-QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
-QPushButton:hover { background: #363b44; }
-QPushButton:disabled { color: #6b7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { background: #1b1e24; color: #9aa0a8; padding: 5px 12px; border-radius: 6px; margin-right: 3px; }
-QTabBar::tab:selected { background: #2a3140; color: #e6e8eb; }
-QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
-QMenu::item:selected { background: #2a3140; }
-"""
+STYLE = theme.stylesheet(theme.DARK)
 
 
 def make_icon(color: str) -> QIcon:
@@ -141,7 +125,6 @@ class FolderDialog(QDialog):
     def __init__(self, parent, root, files, total_seen, budget):
         super().__init__(parent)
         self.setWindowTitle(f"Folder context — {Path(root).name}")
-        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
         self.resize(460, 520)
         self.files, self.budget = files, budget
         lay = QVBoxLayout(self)
@@ -244,8 +227,13 @@ class Gadget(QWidget):
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
         self.resize(420, 660)
+        self.theme = theme.ThemeController(self.settings, self)
         self._build_ui()
-        self.setStyleSheet(STYLE)
+        self._apply_theme(self.theme.tokens)
+        self.theme.changed.connect(self._apply_theme)
+        self.actions = register_primary_actions(ActionRegistry(), self)
+        self._shortcuts = (self.actions.bind_shortcuts(self)
+                           + self.actions.bind_shortcuts(self.chat_page, scope='chat'))
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -291,16 +279,23 @@ class Gadget(QWidget):
         self.status_lbl = QLabel("offline")
         self.power_btn = QPushButton("Start")
         self.power_btn.clicked.connect(self.toggle_service)
-        close = QPushButton("✕")
-        close.setFixedWidth(30)
-        close.setToolTip("Hide to tray")
-        close.clicked.connect(self.hide)
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedWidth(30)
+        self.close_btn.setToolTip("Hide to tray")
+        self.close_btn.clicked.connect(self.hide)
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
         top.addWidget(self.power_btn)
-        top.addWidget(close)
+        top.addWidget(self.close_btn)
         lay.addLayout(top)
+
+        # Collapsible sidebar panel (Cmd+B): profile, endpoint and window mode.
+        self.sidebar = QWidget()
+        side = QVBoxLayout(self.sidebar)
+        side.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.sidebar)
+        self.sidebar.setVisible(self.settings.value("sidebar_visible", True, bool))
 
         prow = QHBoxLayout()
         prow.addWidget(QLabel("Profile"))
@@ -310,12 +305,12 @@ class Gadget(QWidget):
         self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
         self.profile_cb.currentIndexChanged.connect(self._on_profile)
         prow.addWidget(self.profile_cb, 1)
-        lay.addLayout(prow)
+        side.addLayout(prow)
 
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
         self.edit_ep_btn.setFixedSize(26, 26)
@@ -323,21 +318,22 @@ class Gadget(QWidget):
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
         erow.addWidget(self.endpoint_lbl, 1)
         erow.addWidget(self.edit_ep_btn)
-        lay.addLayout(erow)
+        side.addLayout(erow)
 
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
         self.gadget_cb.toggled.connect(self._apply_gadget)
-        lay.addWidget(self.gadget_cb)
+        side.addWidget(self.gadget_cb)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._chat_page(), "Chat")
+        self.chat_page = self._chat_page()
+        self.tabs.addTab(self.chat_page, "Chat")
         self.tabs.addTab(self._history_page(), "History")
         self.tabs.addTab(self._settings_page(), "Settings")
         self.tabs.currentChanged.connect(self._on_tab)
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
-        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.db_footer.setProperty("muted", True)
         lay.addWidget(self.db_footer)
         self._update_controls()
 
@@ -356,7 +352,7 @@ class Gadget(QWidget):
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
-        self.stats_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.stats_lbl.setProperty("muted", True)
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
         self.scroll_bottom_btn.setStyleSheet(
             "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
@@ -369,7 +365,7 @@ class Gadget(QWidget):
         lay.addLayout(srow)
 
         self.gpu_lbl = QLabel("GPU: …")
-        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.gpu_lbl.setProperty("muted", True)
         lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = AttachmentStrip()
@@ -491,7 +487,7 @@ class Gadget(QWidget):
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
         self.prompt_msg = QLabel()
-        self.prompt_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
         prow.addWidget(reset_p)
         prow.addWidget(self.prompt_msg, 1)
@@ -510,7 +506,7 @@ class Gadget(QWidget):
         erow.addWidget(reset_ep)
         lay.addLayout(erow)
         self.endpoint_msg = QLabel()
-        self.endpoint_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_msg.setProperty("muted", True)
         lay.addWidget(self.endpoint_msg)
 
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
@@ -578,6 +574,73 @@ class Gadget(QWidget):
         for d in (p for p in paths if Path(p).is_dir()):
             self._add_folder(d)
         self.tabs.setCurrentIndex(0)
+
+    # ---------------------------------------------------------------- keyboard actions
+    def _apply_theme(self, tokens):
+        self.setStyleSheet(theme.stylesheet(tokens))
+        self.view.setStyleSheet(theme.transcript_stylesheet(tokens))
+
+    def cycle_model(self, step):
+        n = self.profile_cb.count()
+        if n:
+            self.profile_cb.setCurrentIndex((self.profile_cb.currentIndex() + step) % n)
+
+    def select_model(self, key):
+        i = self.profile_cb.findData(key)
+        if i >= 0:
+            self.profile_cb.setCurrentIndex(i)
+
+    def show_tab(self, index):
+        self.tabs.setCurrentIndex(index)
+        page = self.tabs.currentWidget()
+        focused = QApplication.focusWidget()
+        if focused is not None and page.isAncestorOf(focused):
+            return
+        w = page.nextInFocusChain()
+        while w is not page and w is not self:  # first focusable control on the page
+            if page.isAncestorOf(w) and w.isVisibleTo(page) and w.isEnabled() \
+                    and w.focusPolicy() & Qt.FocusPolicy.TabFocus:
+                w.setFocus(Qt.FocusReason.ShortcutFocusReason)
+                return
+            w = w.nextInFocusChain()
+
+    def focus_prompt(self):
+        self.show_tab(0)
+        self.input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def focus_parameters(self):
+        self.show_tab(0)
+        for w in (self.tools_cb, self.show_tools_cb, self.yolo_cb):
+            if w.isEnabled():
+                w.setFocus(Qt.FocusReason.ShortcutFocusReason)
+                return
+
+    def clear_chat(self):
+        self.input.clear()
+        self._clear_attachments()
+        self.new_session()
+
+    def copy_last_response(self):
+        for m in reversed(self.msgs):
+            if m['role'] == 'assistant' and m.get('content'):
+                QApplication.clipboard().setText(m['content'])
+                return True
+        return False
+
+    def toggle_sidebar(self):
+        self.sidebar.setVisible(not self.sidebar.isVisible())
+        self.settings.setValue("sidebar_visible", self.sidebar.isVisible())
+
+    def toggle_tool_panel(self):
+        dialog = self._tools_inspector_dialog
+        if dialog is not None and dialog.isVisible():
+            dialog.hide()
+        else:
+            self._show_tools_inspector()
+
+    def toggle_tools_enabled(self):
+        if self.tools_cb.isEnabled():
+            self.tools_cb.toggle()
 
     # ---------------------------------------------------------------- service / stats
     def current_base_url(self) -> str:
@@ -807,6 +870,7 @@ class Gadget(QWidget):
             self._tools_inspector_dialog = ToolInspectorDialog(workspace=self.workspace, parent=self)
             self._tools_inspector_dialog.refresh_requested.connect(self._on_mcp_refresh)
             self._tools_inspector_dialog.disconnect_requested.connect(self._on_mcp_disconnect)
+            self._tool_shortcuts = self.actions.bind_shortcuts(self._tools_inspector_dialog, scope='tools')
         self._tools_inspector_dialog.set_active_turn(self.worker is not None)
         tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
@@ -1020,7 +1084,6 @@ class Gadget(QWidget):
             worker.decide(call_id, True)
             return
         dialog = QDialog(self)
-        dialog.setStyleSheet('QDialog { background: #14161a; }')
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.resize(620, 420)
         layout = QVBoxLayout(dialog)
