@@ -2,12 +2,13 @@ import json
 import re
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
@@ -15,25 +16,24 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
+from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, UiScaleState, ZoomShortcuts, label_controls,
+                   register_accessible_control as name_control)
 from .chat import ChatWorker
-from .chat_ui import (ChatTranscript, AttachmentStrip, ErrorRecoveryBanner, ImagePreviewDialog,
-                      LifecycleStatusBar, TokenFrameCoalescer, install_cancel_shortcut)
-from .errors import (SETTINGS_DATABASE, SETTINGS_MCP, SETTINGS_PROFILE, chat_failure, mcp_config_failure,
-                     mcp_provider_failure, model_failure)
-from .lifecycle import SurfaceLifecycleController, SurfaceState
+from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
+from .theme import DARK_TOKENS, stylesheet
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
-from .workers import WorkerQueue
 from .db import DEFAULT_DB, Database
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
 
 DEFAULT_USER = socket.gethostname()  # PC name
-COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
+COLORS = {"online": DARK_TOKENS.status_success, "loading": DARK_TOKENS.status_warning,
+          "offline": DARK_TOKENS.status_error}
 
 
 def clean_endpoint(url: str) -> str:
@@ -42,25 +42,6 @@ def clean_endpoint(url: str) -> str:
         url = "http://" + url
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
-
-STYLE = """
-QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
-QLabel, QCheckBox { color: #d0d4da; }
-QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
-    border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
-QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
-QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
-QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
-QListWidget::item:selected { background: #2a3140; }
-QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
-QPushButton:hover { background: #363b44; }
-QPushButton:disabled { color: #6b7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { background: #1b1e24; color: #9aa0a8; padding: 5px 12px; border-radius: 6px; margin-right: 3px; }
-QTabBar::tab:selected { background: #2a3140; color: #e6e8eb; }
-QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
-QMenu::item:selected { background: #2a3140; }
-"""
 
 
 def make_icon(color: str) -> QIcon:
@@ -109,6 +90,14 @@ def model_content(m: dict, vision: bool):
         {"type": "image_url", "image_url": {"url": a["data"]}} for a in imgs]
 
 
+class Bridge(QObject):
+    status = pyqtSignal(str)
+    gpus = pyqtSignal(list)
+    ctx = pyqtSignal(object)
+    model = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+
 class InputBox(QTextEdit):
     submit = pyqtSignal()
     clip_menu = pyqtSignal()
@@ -137,7 +126,6 @@ class FolderDialog(QDialog):
     def __init__(self, parent, root, files, total_seen, budget):
         super().__init__(parent)
         self.setWindowTitle(f"Folder context — {Path(root).name}")
-        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
         self.resize(460, 520)
         self.files, self.budget = files, budget
         lay = QVBoxLayout(self)
@@ -169,6 +157,8 @@ class FolderDialog(QDialog):
         row.addWidget(cancel)
         row.addWidget(ok)
         lay.addLayout(row)
+        name_control(self.list, "Files to add")
+        label_controls(self)
         self._update()
 
     def _set_all(self, st):
@@ -185,7 +175,7 @@ class FolderDialog(QDialog):
         sel = self.selected()
         chars = sum(f["chars"] for f in sel)
         over = chars > self.budget
-        color = "#f85149" if over else "#3fb950"
+        color = DARK_TOKENS.status_error if over else DARK_TOKENS.status_success
         self.info.setText(
             f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
             f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
@@ -203,6 +193,7 @@ class Gadget(QWidget):
         self._workers = set()
         self._approval_dialog = None
         self._pending_action = None
+        self._turn_has_exchange = False
         self._shutting_down = False
         self.tool_status = ''
         self.workspace = ''
@@ -218,18 +209,8 @@ class Gadget(QWidget):
         self.last_speed = ""
         self.last_error = ""
         self.reply = ""
-        # One lifecycle controller drives the chat transcript and the tool inspector.
-        self.lifecycle = SurfaceLifecycleController(self)
-        self._turn_token = None
-        self._cancel_partial = None
-        self._model_starting = False
-        self._mcp_future = None
-        self._mcp_retry = None
-        self._mcp_connecting = False  # Connect / Refresh: failed providers are reported too
-        self._mcp_reported = None
-        self._chat_error = None
+        self._ntok = 0
         self._render_pending = False
-        self._follow_tail = True
         self._drag = None
         self._busy_toggle = False
         self.msgs = []
@@ -250,16 +231,20 @@ class Gadget(QWidget):
         self.setAcceptDrops(True)
         self.resize(420, 660)
         self._build_ui()
-        self.setStyleSheet(STYLE)
-        self.lifecycle.state_changed.connect(self._on_lifecycle_state)
-        # Esc cancels the active turn; an open popup / modal overlay is closed first instead.
-        self.cancel_shortcut = install_cancel_shortcut(self, self.stop_turn)
+        pt = QApplication.font().pointSizeF()
+        self._base_pt = pt if pt > 0 else 10.0
+        self.ui_scale = UiScaleState(self.settings.value("ui_scale", UiScaleState.DEFAULT))
+        self._apply_scale()
+        self.zoom_shortcuts = ZoomShortcuts(self, self.zoom)  # Cmd/Ctrl + = / - / 0
+        self.focus_tracker = KeyboardFocusTracker(self)
+        self.overlay_trap = OverlayFocusTrap(lambda: self.input, self)
 
-        # Blocking systemctl / HTTP / nvidia-smi calls run on background QThreads.
-        self.jobs = WorkerQueue(self)
-        # Streamed tokens reach the transcript at most once per 16ms frame.
-        self.token_coalescer = TokenFrameCoalescer(parent=self)
-        self.token_coalescer.flushed.connect(self._on_token_frame)
+        self.bridge = Bridge()
+        self.bridge.status.connect(self._set_status)
+        self.bridge.gpus.connect(self._set_gpus)
+        self.bridge.model.connect(self._set_model)
+        self.bridge.error.connect(lambda m: QMessageBox.warning(self, 'Profile error', m))
+        self.bridge.ctx.connect(lambda n: setattr(self, "n_ctx", n or self.n_ctx))
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
 
@@ -298,10 +283,10 @@ class Gadget(QWidget):
         self.status_lbl = QLabel("offline")
         self.power_btn = QPushButton("Start")
         self.power_btn.clicked.connect(self.toggle_service)
-        close = QPushButton("✕")
-        close.setFixedWidth(30)
+        close = self.close_btn = QPushButton("✕")
         close.setToolTip("Hide to tray")
         close.clicked.connect(self.hide)
+        name_control(close, "Hide to tray")
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
@@ -316,18 +301,19 @@ class Gadget(QWidget):
             self.profile_cb.addItem(p.label, p.key)
         self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
         self.profile_cb.currentIndexChanged.connect(self._on_profile)
+        name_control(self.profile_cb, "Profile")
         prow.addWidget(self.profile_cb, 1)
         lay.addLayout(prow)
 
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
-        self.edit_ep_btn.setFixedSize(26, 26)
         self.edit_ep_btn.setToolTip("Edit endpoint URL")
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
+        name_control(self.edit_ep_btn, "Edit endpoint URL")
         erow.addWidget(self.endpoint_lbl, 1)
         erow.addWidget(self.edit_ep_btn)
         lay.addLayout(erow)
@@ -339,15 +325,16 @@ class Gadget(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._chat_page(), "Chat")
         self.tabs.addTab(self._history_page(), "History")
-        self.settings_tab = self._settings_page()
-        self.tabs.addTab(self.settings_tab, "Settings")
+        self.tabs.addTab(self._settings_page(), "Settings")
         self.tabs.currentChanged.connect(self._on_tab)
+        name_control(self.tabs.tabBar(), "Sections")
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
-        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.db_footer.setProperty("muted", True)
         lay.addWidget(self.db_footer)
         self._update_controls()
+        label_controls(self)
 
     def _chat_page(self):
         w = QWidget()
@@ -356,38 +343,28 @@ class Gadget(QWidget):
 
         self.view = ChatTranscript()
         self.view.image_requested.connect(self._preview_image)
+        name_control(self.view, "Chat transcript")
         lay.addWidget(self.view, 1)
 
         vbar = self.view.verticalScrollBar()
         vbar.valueChanged.connect(self._on_scroll)
         vbar.sliderReleased.connect(self._schedule_render)
 
-        self.chat_status = LifecycleStatusBar()
-        self.chat_status.bind(self.lifecycle)
-        lay.addWidget(self.chat_status)
-
-        # Backend / model / tool failures recover inline instead of as raw error text.
-        self.chat_banner = ErrorRecoveryBanner()
-        self.chat_banner.open_settings_requested.connect(self._open_settings)
-        self.chat_banner.dismissed.connect(self._on_chat_error_dismissed)
-        lay.addWidget(self.chat_banner)
-
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
-        self.stats_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.stats_lbl.setProperty("muted", True)
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
-        self.scroll_bottom_btn.setStyleSheet(
-            "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
-            "padding: 2px 8px; font-size: 11px;")
+        self.scroll_bottom_btn.setProperty("accent", True)
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
+        name_control(self.scroll_bottom_btn, "Jump to latest messages")
         self.scroll_bottom_btn.hide()
         srow.addWidget(self.stats_lbl, 1)
         srow.addWidget(self.scroll_bottom_btn)
         lay.addLayout(srow)
 
         self.gpu_lbl = QLabel("GPU: …")
-        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.gpu_lbl.setProperty("muted", True)
         lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = AttachmentStrip()
@@ -402,10 +379,10 @@ class Gadget(QWidget):
 
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter send · Ctrl+Shift+V clips)")
-        self.input.setFixedHeight(64)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
+        name_control(self.input, "Message")
         lay.addWidget(self.input)
 
         tools_row = QHBoxLayout()
@@ -445,13 +422,16 @@ class Gadget(QWidget):
         if self.profile.vision:
             self.attach_btn.setText("📎 File / 🖼 Image")
         self.attach_btn.clicked.connect(self._pick_files)
+        name_control(self.attach_btn, "Attach files")
         self.folder_btn = QPushButton("📁 Folder")
         self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
                                    "skips binaries/node_modules) — or drop a folder on the window")
         self.folder_btn.clicked.connect(self._pick_folder)
+        name_control(self.folder_btn, "Add folder context")
         self.clip_btn = QPushButton("📋 Clips")
         self.clip_btn.setToolTip("Clipboard memory (Ctrl+Shift+V)")
         self.clip_btn.clicked.connect(self._show_clip_menu)
+        name_control(self.clip_btn, "Clipboard memory")
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send)
         self.stop_btn = QPushButton('Stop')
@@ -474,6 +454,7 @@ class Gadget(QWidget):
         lay.addWidget(self.hist_user_lbl)
         self.hist_list = QListWidget()
         self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
+        name_control(self.hist_list, "Saved sessions")
         lay.addWidget(self.hist_list, 1)
         row = QHBoxLayout()
         for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
@@ -495,12 +476,15 @@ class Gadget(QWidget):
         apply_u = QPushButton("Apply")
         apply_u.clicked.connect(self._apply_user)
         self.user_edit.returnPressed.connect(self._apply_user)
+        name_control(self.user_edit, "User name")
+        name_control(apply_u, "Apply user name")
         urow.addWidget(self.user_edit, 1)
         urow.addWidget(apply_u)
         lay.addLayout(urow)
 
         lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
+        name_control(self.prompt_edit, "System prompt")
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
         prow = QHBoxLayout()
@@ -508,8 +492,9 @@ class Gadget(QWidget):
         save_p.clicked.connect(self._save_prompt)
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
+        name_control(reset_p, "Reset system prompt to default")
         self.prompt_msg = QLabel()
-        self.prompt_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
         prow.addWidget(reset_p)
         prow.addWidget(self.prompt_msg, 1)
@@ -523,12 +508,15 @@ class Gadget(QWidget):
         self.endpoint_edit.returnPressed.connect(self._apply_endpoint)
         reset_ep = QPushButton("Reset to default")
         reset_ep.clicked.connect(self._reset_endpoint)
+        name_control(self.endpoint_edit, "Endpoint URL")
+        name_control(apply_ep, "Apply endpoint URL")
+        name_control(reset_ep, "Reset endpoint URL to default")
         erow.addWidget(self.endpoint_edit, 1)
         erow.addWidget(apply_ep)
         erow.addWidget(reset_ep)
         lay.addLayout(erow)
         self.endpoint_msg = QLabel()
-        self.endpoint_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_msg.setProperty("muted", True)
         lay.addWidget(self.endpoint_msg)
 
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
@@ -537,10 +525,11 @@ class Gadget(QWidget):
         self.db_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         lay.addWidget(self.db_status)
         drow = QHBoxLayout()
-        browse = self.db_browse_btn = QPushButton("Browse / select…")
+        browse = QPushButton("Browse / select…")
         browse.clicked.connect(self._browse_db)
         default = QPushButton("Use default")
         default.clicked.connect(lambda: self._switch_db(DEFAULT_DB))
+        name_control(default, "Use default database")
         clear_clips = QPushButton("Clear clips")
         clear_clips.clicked.connect(self._clear_clips)
         for b in (browse, default, clear_clips):
@@ -565,6 +554,18 @@ class Gadget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, bool(on))
         self.setWindowFlags(flags)
         self.show()
+
+    def zoom(self, action):
+        self.ui_scale.apply(action)
+        self.settings.setValue("ui_scale", self.ui_scale.scale_factor)
+        self._apply_scale()
+
+    def _apply_scale(self):
+        scale = self.ui_scale.scale_factor
+        self.setStyleSheet(stylesheet(DARK_TOKENS, scale, self._base_pt))
+        self.close_btn.setFixedWidth(round(30 * scale))
+        self.edit_ep_btn.setFixedSize(round(26 * scale), round(26 * scale))
+        self.input.setFixedHeight(round(64 * scale))
 
     def toggle_visible(self):
         if self.isVisible():
@@ -642,28 +643,20 @@ class Gadget(QWidget):
             self._set_endpoint(text.strip())
 
     def _poll(self):
-        if self._shutting_down:
-            return
-        job = self.jobs.submit(self._poll_job, self.current_base_url(), self.profile.unit, not self.n_ctx)
-        job.signals.progress_emitted.connect(self._on_poll_progress)
+        prof = self.profile
+        base_url = self.current_base_url()
 
-    @staticmethod
-    def _poll_job(base_url, unit, need_ctx):
-        st = service.status(base_url, unit)
-        yield {"status": st}
-        yield {"gpus": service.gpu_stats()}
-        if st == "offline":
-            yield {"model": None}
-            return
-        if need_ctx:
-            yield {"ctx": service.n_ctx(base_url)}
-        yield {"model": service.model_info(base_url)}
-
-    def _on_poll_progress(self, update):
-        handlers = {"status": self._set_status, "gpus": self._set_gpus, "model": self._set_model,
-                    "ctx": lambda n: setattr(self, "n_ctx", n or self.n_ctx)}
-        for key, value in update.items():
-            handlers[key](value)
+        def job():
+            st = service.status(base_url, prof.unit)
+            self.bridge.status.emit(st)
+            self.bridge.gpus.emit(service.gpu_stats())
+            if st == "offline":
+                self.bridge.model.emit(None)
+                return
+            if not self.n_ctx:
+                self.bridge.ctx.emit(service.n_ctx(base_url))
+            self.bridge.model.emit(service.model_info(base_url))
+        threading.Thread(target=job, daemon=True).start()
 
     def _set_model(self, info):
         if not info:
@@ -681,15 +674,6 @@ class Gadget(QWidget):
             f"GPU{g['index']} {g['name']}: {g['util']}% · {g['used']}/{g['total']} MiB · {g['temp']}°C"
             for g in gpus) or "GPU: n/a")
 
-    def _model_initializing(self):
-        return self.state == "loading" or self._model_starting
-
-    def _sync_skeleton(self):
-        # Placeholders stand in for the pending reply (turn Loading) or the empty
-        # transcript while the model itself is still starting.
-        self.view.set_skeleton(self.lifecycle.state is SurfaceState.LOADING
-                               or (not self.msgs and self._model_initializing()))
-
     def _set_status(self, s):
         self.state = s
         self.dot.setStyleSheet(f"color: {COLORS[s]}; font-size: 16px;")
@@ -700,7 +684,6 @@ class Gadget(QWidget):
         self.tray_toggle.setText("Stop service" if s != "offline" else "Start service")
         self.power_btn.setEnabled(not self._busy_toggle)
         self._update_controls()
-        self._sync_skeleton()
 
     def _on_profile(self, _i):
         key = self.profile_cb.currentData()
@@ -731,68 +714,43 @@ class Gadget(QWidget):
             return
         prof = self.profile
         want_stop = self.state != "offline"
+        if not want_stop:
+            conflicts = profiles.active_conflicts(prof)
+            if conflicts:
+                names = "\n".join(f"• {c.label}" for c in conflicts)
+                if QMessageBox.question(
+                        self, "Switch profile",
+                        f"Starting “{prof.label}” needs the GPU/port used by:\n{names}\n\nThey will be stopped. Continue?"
+                ) != QMessageBox.StandardButton.Yes:
+                    return
         self._busy_toggle = True
-        self._model_starting = not want_stop
         self.power_btn.setEnabled(False)
         self.status_lbl.setText("stopping…" if want_stop else "starting…")
-        if want_stop:
-            self._submit_toggle(prof, True)
-            return
-        # systemctl is-active can take seconds per conflict; never probe on the GUI thread.
-        job = self.jobs.submit(profiles.active_conflicts, prof)
-        job.signals.job_completed.connect(lambda conflicts: self._confirm_start(prof, conflicts))
-        job.signals.job_failed.connect(lambda exc: self._toggle_done(prof, None, str(exc)))
 
-    def _confirm_start(self, prof, conflicts):
-        if conflicts:
-            names = "\n".join(f"• {c.label}" for c in conflicts)
-            if QMessageBox.question(
-                    self, "Switch profile",
-                    f"Starting “{prof.label}” needs the GPU/port used by:\n{names}\n\nThey will be stopped. Continue?"
-            ) != QMessageBox.StandardButton.Yes:
-                self._toggle_done(prof, None, "")
-                return
-        self._submit_toggle(prof, False)
-
-    def _submit_toggle(self, prof, want_stop):
-        job = self.jobs.submit(self._toggle_job, prof, want_stop, self.current_base_url())
-        job.signals.job_completed.connect(lambda result: self._toggle_done(prof, *result, want_stop))
-        job.signals.job_failed.connect(lambda exc: self._toggle_done(prof, None, str(exc), want_stop))
-
-    def _toggle_job(self, prof, want_stop, base_url):
-        err = ""
-        try:
-            if want_stop:
-                profiles.stop(prof)
-                # dual-GPU profiles parked the always-on tier: bring it back
-                if prof.key in ("vision", "agent-27b") and self.settings.value("parked_services", False, bool):
-                    self.settings.setValue("parked_services", False)
-                    profiles.start(profiles.PROFILES["services"])
-            else:
-                for c in profiles.active_conflicts(prof):
-                    if prof.key in ("vision", "agent-27b") and c.key == "services":
-                        self.settings.setValue("parked_services", True)
-                    profiles.stop(c)
-                if prof.key == "services":
-                    self.settings.setValue("parked_services", False)
-                profiles.start(prof)
-        except Exception as e:  # noqa: BLE001
-            err = str(e)
-        return service.status(base_url, prof.unit), err
-
-    def _toggle_done(self, prof, status, err, stopping=False):
-        self._busy_toggle = False
-        self._model_starting = False
-        self._set_status(status or self.state)
-        if err:
-            self._present_chat_error(model_failure(
-                prof.label, err, stopping=stopping, retry=lambda: self._retry_toggle(prof, stopping),
-                context={'unit': prof.unit, 'endpoint': self.current_base_url()}))
-
-    def _retry_toggle(self, prof, stopping):
-        # Re-run the same start/stop only if it is still the selected profile and still needed.
-        if self.profile.key == prof.key and not self._busy_toggle and stopping == (self.state != "offline"):
-            self.toggle_service()
+        def job():
+            err = ""
+            try:
+                if want_stop:
+                    profiles.stop(prof)
+                    # dual-GPU profiles parked the always-on tier: bring it back
+                    if prof.key in ("vision", "agent-27b") and self.settings.value("parked_services", False, bool):
+                        self.settings.setValue("parked_services", False)
+                        profiles.start(profiles.PROFILES["services"])
+                else:
+                    for c in profiles.active_conflicts(prof):
+                        if prof.key in ("vision", "agent-27b") and c.key == "services":
+                            self.settings.setValue("parked_services", True)
+                        profiles.stop(c)
+                    if prof.key == "services":
+                        self.settings.setValue("parked_services", False)
+                    profiles.start(prof)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+            self._busy_toggle = False
+            self.bridge.status.emit(service.status(self.current_base_url(), prof.unit))
+            if err:
+                self.bridge.error.emit(f"{prof.label}: {err}")
+        threading.Thread(target=job, daemon=True).start()
 
     def _update_stats(self):
         turns = sum(1 for m in self.msgs if m["role"] == "user")
@@ -812,8 +770,7 @@ class Gadget(QWidget):
 
     def _update_controls(self):
         self.send_btn.setEnabled(self.state == "online" and self.worker is None)
-        self.stop_btn.setEnabled(self.lifecycle.is_active())
-        self.chat_banner.set_retry_blocked(self.worker is not None or self._busy_toggle)
+        self.stop_btn.setEnabled(self.worker is not None)
         self.workspace_btn.setEnabled(self.worker is None)
         mcp_tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         eligible = (bool(self.workspace) or bool(mcp_tools)) and self.profile.key in ('agent-gpu0', 'agent-27b')
@@ -842,59 +799,33 @@ class Gadget(QWidget):
         if self.worker is not None:
             return
         manager = self._ensure_mcp_manager()
-        try:
-            future = manager.connect(load_config(self.mcp_config_path))
-        except Exception as exc:  # unreadable / invalid config: recover inline, never crash the slot
-            self._show_tools_inspector()
-            self._tools_inspector_dialog.begin_provider_refresh()
-            self._tools_inspector_dialog.fail_provider_refresh(mcp_config_failure(exc, retry=self._on_mcp_refresh))
-            return
-        self._track_mcp(future, retry=self._on_mcp_refresh, connecting=True)
+        config = load_config(self.mcp_config_path)
+        future = manager.connect(config)
+        future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
 
     def _on_mcp_disconnect(self):
         if self.worker is not None or not self.mcp_manager:
             return
-        self._track_mcp(self.mcp_manager.disconnect(), retry=self._on_mcp_disconnect)
+        future = self.mcp_manager.disconnect()
+        future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
 
     def _on_mcp_config_saved(self, config):
         if self.worker is None and self.mcp_manager:
-            self._track_mcp(self.mcp_manager.disconnect(), retry=self._on_mcp_disconnect)
-
-    def _track_mcp(self, future, retry=None, connecting=False):
-        """The inspector shows Loading (skeleton) until this provider operation settles."""
-        self._mcp_future, self._mcp_retry, self._mcp_connecting = future, retry, connecting
-        if self._tools_inspector_dialog is not None:
-            self._tools_inspector_dialog.begin_provider_refresh()
-        future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
+            future = self.mcp_manager.disconnect()
+            future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
 
     def _on_mcp_snapshot_updated(self):
         if self._tools_inspector_dialog is not None:
             tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
             statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
-            error = self._mcp_failure(statuses)
-            if error is not None:
-                self._tools_inspector_dialog.fail_provider_refresh(error)
             self._tools_inspector_dialog.update_snapshot(tools, statuses, workspace=self.workspace)
         self._update_controls()
-
-    def _mcp_failure(self, statuses):
-        """UiError for the settled provider operation (reported once), or None."""
-        future = self._mcp_future
-        if future is None or not future.done() or future is self._mcp_reported:
-            return None
-        self._mcp_reported = future
-        exc = RuntimeError('MCP operation was cancelled') if future.cancelled() else future.exception()
-        failed = {name: st.get('error', '') for name, st in statuses.items()
-                  if st.get('status') == 'failed'} if self._mcp_connecting else {}
-        return mcp_provider_failure(failed, error=exc, retry=self._mcp_retry)
 
     def _show_tools_inspector(self):
         if self._tools_inspector_dialog is None:
             self._tools_inspector_dialog = ToolInspectorDialog(workspace=self.workspace, parent=self)
             self._tools_inspector_dialog.refresh_requested.connect(self._on_mcp_refresh)
             self._tools_inspector_dialog.disconnect_requested.connect(self._on_mcp_disconnect)
-            self._tools_inspector_dialog.open_settings_requested.connect(self._open_settings)
-            self._tools_inspector_dialog.bind_turn(self.lifecycle)
         self._tools_inspector_dialog.set_active_turn(self.worker is not None)
         tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
@@ -911,28 +842,6 @@ class Gadget(QWidget):
         self._mcp_config_dialog.show()
         self._mcp_config_dialog.raise_()
         self._mcp_config_dialog.activateWindow()
-
-    def _open_settings(self, section):
-        """Banner Open Settings: jump to the panel for the failure. The conversation and the
-        banner stay as they are, so Retry is available once the configuration is updated."""
-        if section == SETTINGS_MCP:
-            self._show_mcp_config()
-            return
-        self.tabs.setCurrentWidget(self.settings_tab)
-        target = {SETTINGS_PROFILE: self.profile_cb, SETTINGS_DATABASE: self.db_browse_btn}.get(
-            section, self.endpoint_edit)
-        target.setFocus(Qt.FocusReason.OtherFocusReason)
-        if target is self.endpoint_edit:
-            self.endpoint_edit.selectAll()
-
-    def _present_chat_error(self, error):
-        self._chat_error = error
-        self.chat_banner.present_error(error)
-        self._update_controls()
-
-    def _on_chat_error_dismissed(self):
-        self._chat_error = None
-        self.lifecycle.dismiss_error()  # Error -> Idle
 
     def _pick_workspace(self):
         if self.worker is not None:
@@ -954,13 +863,8 @@ class Gadget(QWidget):
         prev_max = bar.maximum()
         stick = (prev_val >= prev_max - 48) if prev_max > 0 else True
 
-        # While Loading the skeleton stands in for the pending reply; after a cancel the
-        # winding-down worker shows no activity, only the preserved partial reply.
-        active = self.worker is not None and self.lifecycle.is_active()
-        streaming = self.lifecycle.state is SurfaceState.STREAMING
-        self._sync_skeleton()
         self.view.set_messages(self.msgs, live_reply=self.reply if self.worker else '',
-                               activity=(self.tool_status or ('…' if streaming else '')) if active else '',
+                               activity=(self.tool_status or '…') if self.worker else '',
                                error=self.last_error, show_tools=self.show_tools_cb.isChecked())
 
         if stick:
@@ -997,8 +901,6 @@ class Gadget(QWidget):
     def _on_scroll(self, val):
         bar = self.view.verticalScrollBar()
         at_bottom = (val >= bar.maximum() - 48) if bar.maximum() > 0 else True
-        # Content growth never changes the value, so this only flips on real scrolling.
-        self._follow_tail = at_bottom
         if hasattr(self, "scroll_bottom_btn"):
             self.scroll_bottom_btn.setVisible(not at_bottom and bar.maximum() > 60)
 
@@ -1052,12 +954,18 @@ class Gadget(QWidget):
         text = self.input.toPlainText().strip()
         if (not text and not self.attachments) or self.worker is not None or self.state != "online":
             return
-        try:
-            registry = self._turn_registry()
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, 'Invalid workspace', str(exc))
-            return
-        self._discard_unanswered_turn()
+        registry = None
+        if self.tools_cb.isChecked():
+            local_reg = None
+            if self.workspace:
+                try:
+                    local_reg = ToolRegistry(self.workspace)
+                except (OSError, ValueError) as exc:
+                    QMessageBox.warning(self, 'Invalid workspace', str(exc))
+                    return
+            snapshot = self.mcp_manager.snapshot() if self.mcp_manager else ()
+            if local_reg or snapshot:
+                registry = ToolCatalog(local_reg, self.mcp_manager, snapshot)
         if self.session_id is None:
             title = (text or self.attachments[0]["name"]).splitlines()[0][:48]
             self.session_id = self.db.create_session(self.user, title)
@@ -1067,63 +975,17 @@ class Gadget(QWidget):
         self.msgs.append(msg)
         self.input.clear()
         self._clear_attachments()
-        self._start_turn(registry)
-
-    def _discard_unanswered_turn(self):
-        """A new message supersedes a previous turn that never got a reply (failed or
-        cancelled before any content came back) instead of stacking two 'user' messages in a
-        row in history/payload - some chat templates reject non-alternating roles. Retry
-        re-dispatches the same stored message directly and never goes through send()."""
-        if self.msgs and self.msgs[-1]['role'] == 'user':
-            stale = self.msgs.pop()
-            self.db.delete_message(stale['id'])
-
-    def _turn_registry(self):
-        """Per-turn tool router (None when tools are off); raises for an invalid workspace."""
-        if not self.tools_cb.isChecked():
-            return None
-        local_reg = ToolRegistry(self.workspace) if self.workspace else None
-        snapshot = self.mcp_manager.snapshot() if self.mcp_manager else ()
-        return ToolCatalog(local_reg, self.mcp_manager, snapshot) if local_reg or snapshot else None
-
-    def _retry_turn(self):
-        """Banner Retry: re-dispatch the failed turn from the conversation as it stands. The
-        original request is already in the transcript and history, so nothing is re-appended."""
-        if self._shutting_down or self.session_id is None or not self.msgs:
-            return
-        if self.worker is not None:  # the failed worker is still winding down
-            self._pending_action = self._retry_turn
-            return
-        try:
-            registry = self._turn_registry()
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, 'Invalid workspace', str(exc))
-            if self._chat_error is not None:
-                self._present_chat_error(self._chat_error)  # still failed: keep it actionable
-            return
-        self._start_turn(registry)
-
-    def _turn_context(self):
-        worker = self.worker
-        return {'operation': 'chat turn', 'profile': self.profile.key, 'endpoint': self.current_base_url(),
-                'model': self.model_name or 'unknown',
-                'tools': bool(worker is not None and worker.registry is not None)}
-
-    def _start_turn(self, registry):
-        self.chat_banner.clear_error()  # a new request supersedes the previous failure
-        self._chat_error = None
         self.last_error = ""
         self.reply = ""
+        self._ntok = 0
         self.last_speed = ""
         self.tool_status = ''
+        self._turn_has_exchange = False
 
         payload = self._payload()
         worker = ChatWorker(payload, base_url=self.current_base_url(), parent=self, registry=registry)
         self.worker = worker
         self._workers.add(worker)
-        self._cancel_partial = None
-        self._turn_token = self.lifecycle.start_operation()  # Idle/Error -> Loading
-        self._turn_token.register_on_cancel(lambda: self._detach_turn(worker))
         # Signals from a retired turn must never modify another session.
         def connect(signal, callback):
             signal.connect(lambda *args: callback(*args) if self.worker is worker else None)
@@ -1177,7 +1039,6 @@ class Gadget(QWidget):
             worker.decide(call_id, True)
             return
         dialog = QDialog(self)
-        dialog.setStyleSheet('QDialog { background: #14161a; }')
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.resize(620, 420)
         layout = QVBoxLayout(dialog)
@@ -1225,8 +1086,11 @@ class Gadget(QWidget):
         row.addWidget(deny)
         row.addWidget(approve)
         layout.addLayout(row)
+        name_control(preview, "Tool call details")
+        name_control(approve, f"Approve {display_name}")
+        name_control(deny, f"Deny {display_name}")
         self._approval_dialog = dialog
-        self._set_tool_status(f'Waiting for approval: {display_name}')
+        self.tool_status = f'Waiting for approval: {display_name}'
         self._schedule_render()
         def decided(result):
             if self._approval_dialog is dialog:
@@ -1236,20 +1100,12 @@ class Gadget(QWidget):
         dialog.finished.connect(decided)
         dialog.open()
 
-    def _set_tool_status(self, text):
-        self.tool_status = text
-        if self._tools_inspector_dialog is not None:
-            self._tools_inspector_dialog.set_turn_activity(text)
-
     def _on_tool_started(self, call_id, name):
-        self._set_tool_status(f'Running {name}…')
+        self.tool_status = f'Running {name}…'
         self._schedule_render()
 
-    def _turn_detached(self):
-        return self._turn_token is not None and self._turn_token.is_cancelled()
-
     def _on_exchange(self, exchange):
-        self.token_coalescer.stop()
+        self._turn_has_exchange = True
         try:
             self.msgs.extend(self.db.add_exchange(self.session_id, exchange))
         except Exception as exc:  # UI persistence boundary
@@ -1260,17 +1116,11 @@ class Gadget(QWidget):
                 self.msgs.append(dict(role=message['role'], content=message['content'], metadata=metadata,
                                       attachments=[], ts=time.strftime('%Y-%m-%d %H:%M:%S')))
             self.stop_turn()
-        # Completed tool side effects are kept even after Stop; the exchange's assistant
-        # message already carries the streamed text, so there is no separate partial.
-        self._cancel_partial = None
         self.reply = ''
-        self._set_tool_status('' if self._turn_detached() else 'Waiting for the next response…')
+        self.tool_status = 'Waiting for the next response…'
         self._schedule_render()
 
     def _on_message(self, message):
-        if self._turn_detached():
-            return  # stopped: the partial reply on screen is what gets kept
-        self.token_coalescer.stop()
         try:
             self.msgs.extend(self.db.add_exchange(self.session_id, [message]))
         except Exception as exc:
@@ -1280,37 +1130,17 @@ class Gadget(QWidget):
         self.reply = ''
 
     def _on_token(self, t):
-        if self._turn_detached():
-            return  # trailing tokens from a winding-down worker are never rendered
-        self.token_coalescer.enqueue(t)
-        self.lifecycle.record_tokens(1)
-
-    def _on_token_frame(self, text):
-        # One incremental append and at most one scroll pass per 16ms frame. Auto-scroll
-        # only follows when the user is already at the bottom (scrolling up pauses it).
-        if self._turn_detached():
-            return
-        self.lifecycle.mark_streaming()  # first frame: skeleton gives way to the live reply
-        self._update_telemetry()
-        self.reply += text
-        bar = self.view.verticalScrollBar()
-        if not self.view.append_live(text):
-            self._render()
-        elif self._follow_tail and not bar.isSliderDown():
-            bar.setValue(bar.maximum())
-
-    def _update_telemetry(self):
-        """Refresh tokens/s once per frame tick rather than per token signal."""
-        telemetry = self.lifecycle.telemetry
-        self.chat_status.refresh()
-        if telemetry.tokens > 1:
-            self.last_speed = f"Gen: {telemetry.tokens_per_sec:.1f} tok/s (live)"
+        self.reply += t
+        self._ntok += 1
+        if self._ntok == 1:
+            self._t0 = time.monotonic()
+        elif self._ntok % 5 == 0:
+            self.last_speed = f"Gen: {(self._ntok - 1) / max(time.monotonic() - self._t0, 1e-6):.1f} tok/s (live)"
             self._update_stats()
+        self._schedule_render()
 
     def _finish(self):
-        self._commit_partial()
-        self.lifecycle.complete()  # no-op after cancel (Idle) or failure (Error)
-        self._set_tool_status('')
+        self.tool_status = ''
         self._update_controls()
         self._render()
         self._refresh_history()
@@ -1320,55 +1150,28 @@ class Gadget(QWidget):
         self._finish()
 
     def _on_fail(self, err):
-        self.token_coalescer.stop()
-        self.lifecycle.fail()  # Loading|Streaming -> Error
-        # The request stays in the conversation so Retry restarts it in place rather than
-        # sending a duplicate; the banner explains the failure in plain language.
+        self.last_error = err
+        if not self._turn_has_exchange and self.msgs and self.msgs[-1]['role'] == 'user':
+            last = self.msgs.pop()
+            self.db.delete_message(last['id'])
+            self.input.setPlainText(last['content'])
+            self.attachments = last['attachments']
+            self._update_attachments()
         self.reply = ''
-        self._present_chat_error(chat_failure(err, retry=self._retry_turn, context=self._turn_context()))
         self._finish()
 
     def _on_cancelled(self):
-        self.token_coalescer.discard()
         if not self.last_error:
             self.last_error = 'Turn stopped. Completed tool results were kept.'
         self.reply = ''
         self._finish()
 
     def stop_turn(self):
-        """Stop button / Esc: detach the stream and return to Idle within this frame. The
-        worker winds down in the background; completed side effects are never undone."""
-        self.lifecycle.cancel_active()
         if self.worker:
             self.worker.cancel()
+            self.stop_btn.setEnabled(False)
         if self._approval_dialog:
             self._approval_dialog.reject()
-
-    def _detach_turn(self, worker):
-        # Runs synchronously inside CancellationToken.cancel() on the GUI thread.
-        self.token_coalescer.discard()
-        self._cancel_partial = self.reply  # exactly what is already rendered
-        worker.cancel()
-        self.tool_status = ''
-        if self._approval_dialog:
-            self._approval_dialog.reject()
-
-    def _commit_partial(self):
-        """Keep a stopped reply in the conversation (and history) as it was rendered."""
-        partial, self._cancel_partial = self._cancel_partial, None
-        if not partial:
-            return
-        message = dict(role='assistant', content=partial)
-        try:
-            self.msgs.extend(self.db.add_exchange(self.session_id, [message]))
-        except Exception as exc:  # UI persistence boundary
-            self.last_error = f'Could not save partial answer: {exc}'
-            self.msgs.append(dict(message, attachments=[], metadata={}, ts=time.strftime('%Y-%m-%d %H:%M:%S')))
-        self.reply = ''
-
-    def _on_lifecycle_state(self):
-        self.stop_btn.setEnabled(self.lifecycle.is_active())
-        self._sync_skeleton()
 
     def _thread_finished(self, worker):
         self._workers.discard(worker)
@@ -1383,12 +1186,10 @@ class Gadget(QWidget):
     def _shutdown_workers(self):
         self._shutting_down = True
         self._pending_action = None
-        self.timer.stop()
         self.stop_turn()
         for worker in list(self._workers):
             worker.cancel()
             worker.wait()
-        self.jobs.shutdown()
         if self.mcp_manager is not None:
             self.mcp_manager.close()
             self.mcp_manager = None
@@ -1406,9 +1207,6 @@ class Gadget(QWidget):
         self.msgs, self.session_id = [], None
         self.reply, self.tool_status = '', ''
         self.ctx_used, self.ctx_exact, self.last_speed, self.last_error = 0, True, "", ""
-        self.chat_banner.clear_error()
-        self._chat_error = None
-        self.lifecycle.dismiss_error()  # Error -> Idle
         self._update_controls()
         self._update_stats()
         self._render()
@@ -1520,13 +1318,7 @@ class Gadget(QWidget):
 
     # ---------------------------------------------------------------- history
     def _on_tab(self, i):
-        if i == 0:
-            # The turn kept running while another view was shown: show its latest progress.
-            self.chat_status.refresh()
-            bar = self.view.verticalScrollBar()
-            if self.worker is not None and self._follow_tail:
-                bar.setValue(bar.maximum())
-        elif i == 1:
+        if i == 1:
             self._refresh_history()
         elif i == 2:
             self._refresh_db_status()
@@ -1647,13 +1439,13 @@ class Gadget(QWidget):
         if st["ok"]:
             kb = st["size"] / 1024
             size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
-            html = (f'<span style="color:#3fb950">● Connected</span> · integrity {st["integrity"]} · writable<br>'
+            html = (f'<span style="color:{DARK_TOKENS.status_success}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
                     f'{escape(st["path"])}<br>{size} · {st["sessions"]} sessions · '
                     f'{st["messages"]} messages · {st["clips"]} clips')
             self.db_footer.setText(f"DB ● {name} · {st['sessions']} sessions · {st['messages']} msgs")
         else:
             reason = st.get("error") or ("read-only" if not st.get("writable", True) else st.get("integrity"))
-            html = f'<span style="color:#f85149">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
+            html = f'<span style="color:{DARK_TOKENS.status_error}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
             self.db_footer.setText(f"DB ✕ {name}")
         self.db_status.setText(html)
         self.db_footer.setToolTip(st["path"])

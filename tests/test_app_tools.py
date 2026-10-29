@@ -34,7 +34,8 @@ class AppToolsTests(unittest.TestCase):
         settings = QSettings(str(self.root / 'settings.ini'), QSettings.Format.IniFormat)
         settings.setValue('db_path', str(self.root / 'chat.db'))
         settings.setValue('profile', 'agent-gpu0')
-        with patch('llama_gadget.app.QSettings', return_value=settings), patch.object(Gadget, '_poll'):
+        with patch('llama_gadget.app.QSettings', return_value=settings), patch.object(Gadget, '_poll'), \
+                patch('llama_gadget.app.default_preferences_path', return_value=self.root / 'preferences.json'):
             self.app = Gadget()
         self.app.timer.stop()
         self.app.state = 'online'
@@ -144,10 +145,7 @@ class AppToolsTests(unittest.TestCase):
         self.assertTrue(pump_until(lambda: self.app.worker is None))
         self.assertTrue((self.root / 'new').exists())
         self.assertEqual([m['role'] for m in self.app.msgs], ['user', 'assistant', 'tool'])
-        # The failure is surfaced inline (banner), not as raw error text in the transcript.
-        self.assertIsNotNone(self.app.chat_banner.error)
-        self.assertTrue(self.app.chat_banner.error.can_retry)
-        self.assertEqual(self.app.last_error, '')
+        self.assertTrue(self.app.last_error)
 
     def test_new_session_cancels_approval_and_retains_thread(self):
         self.setup_tools()

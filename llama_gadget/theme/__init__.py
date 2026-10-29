@@ -1,35 +1,36 @@
-"""Shared semantic style tokens for status feedback widgets.
+"""Central design tokens and theming: the single source of truth for GUI styling."""
+from .tokens import (DEFAULT_RADII, DEFAULT_SPACING, DEFAULT_TYPOGRAPHY, Color, CornerRadii,
+                     SemanticColors, SpacingScale, ThemeTokens, TypeToken, TypographyScale)
+from .palettes import DARK_TOKENS, LIGHT_TOKENS
+from .adapter import ThemeAdapter
+from .controller import (SystemAppearance, ThemeController, ThemePreference,
+                         appearance_from_color_scheme, detect_system_appearance)
+from .store import (JsonThemePreferenceStore, ThemePersistError, ThemePreferenceStore,
+                    default_preferences_path)
+from .runtime import ThemeManager
+from .current import (active_adapter, active_tokens, bind_theme, default_preferences_path,
+                      set_active_adapter, theme_hub)
 
-Values mirror the colours the app stylesheet (``app.STYLE``) already uses so new
-status widgets match the existing dark UI from a single source."""
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class ThemeTokens:
-    surface: str = '#14161a'
-    surface_raised: str = '#1b1e24'
-    border: str = '#2a2e35'
-    text: str = '#e6e8eb'
-    text_muted: str = '#8b949e'
-    skeleton: str = '#262a31'
-    idle: str = '#8b949e'
-    loading: str = '#d29922'
-    streaming: str = '#3fb950'
-    error: str = '#f85149'
-    error_surface: str = '#2a1719'
-    success: str = '#3fb950'
-    spacing: int = 4
-    radius: int = 6
-    font_small: int = 11
-
-    def state_color(self, state) -> str:
-        """Semantic colour for a lifecycle state (enum member or its value, e.g. 'Streaming')."""
-        key = str(getattr(state, 'value', state)).lower()
-        return {'idle': self.idle, 'loading': self.loading,
-                'streaming': self.streaming, 'error': self.error}.get(key, self.text_muted)
+DARK = DARK_TOKENS
+LIGHT = LIGHT_TOKENS
 
 
-TOKENS = ThemeTokens()
+def stylesheet(tokens=None):
+    from .adapter import ThemeAdapter
+    toks = tokens or active_tokens()
+    return ThemeAdapter(toks).app_stylesheet()
 
-__all__ = ['ThemeTokens', 'TOKENS']
+
+def toggle():
+    hub = theme_hub()
+    if hub is not None:
+        hub.toggle()
+
+
+__all__ = ['Color', 'CornerRadii', 'DARK_TOKENS', 'JsonThemePreferenceStore', 'LIGHT_TOKENS',
+           'SemanticColors', 'SpacingScale', 'SystemAppearance', 'ThemeAdapter', 'ThemeController',
+           'ThemeManager', 'ThemePersistError', 'ThemePreference', 'ThemePreferenceStore',
+           'ThemeTokens', 'TypeToken', 'TypographyScale', 'appearance_from_color_scheme',
+           'active_adapter', 'active_tokens', 'bind_theme', 'default_preferences_path',
+           'detect_system_appearance', 'set_active_adapter', 'theme_hub',
+           'DARK', 'LIGHT', 'stylesheet', 'toggle']
