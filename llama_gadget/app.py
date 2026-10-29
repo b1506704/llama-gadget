@@ -16,8 +16,11 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
+from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, UiScaleState, ZoomShortcuts, label_controls,
+                   register_accessible_control as name_control)
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
+from .theme import DARK_TOKENS, stylesheet
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
@@ -27,11 +30,10 @@ from .db import DEFAULT_DB, Database
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
-from .theme import (JsonThemePreferenceStore, ThemeManager, ThemePersistError, ThemePreference,
-                    active_adapter, bind_theme, default_preferences_path)
 
 DEFAULT_USER = socket.gethostname()  # PC name
-STATUS_TONES = {"online": "success", "loading": "warning", "offline": "error"}  # service state -> token
+COLORS = {"online": DARK_TOKENS.status_success, "loading": DARK_TOKENS.status_warning,
+          "offline": DARK_TOKENS.status_error}
 
 
 def clean_endpoint(url: str) -> str:
@@ -155,9 +157,8 @@ class FolderDialog(QDialog):
         row.addWidget(cancel)
         row.addWidget(ok)
         lay.addLayout(row)
-        bind_theme(self.apply_theme)
-
-    def apply_theme(self, _adapter):
+        name_control(self.list, "Files to add")
+        label_controls(self)
         self._update()
 
     def _set_all(self, st):
@@ -174,7 +175,7 @@ class FolderDialog(QDialog):
         sel = self.selected()
         chars = sum(f["chars"] for f in sel)
         over = chars > self.budget
-        color = active_adapter().status_color("error" if over else "success")
+        color = DARK_TOKENS.status_error if over else DARK_TOKENS.status_success
         self.info.setText(
             f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
             f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
@@ -215,7 +216,6 @@ class Gadget(QWidget):
         self.msgs = []
         self.session_id = None
         self.attachments = []
-        self._db_st = None
 
         self.user = self.settings.value("user", DEFAULT_USER) or DEFAULT_USER
         self.db = Database()
@@ -230,8 +230,14 @@ class Gadget(QWidget):
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
         self.resize(420, 660)
-        self.theme = ThemeManager(JsonThemePreferenceStore(default_preferences_path()), parent=self)
         self._build_ui()
+        pt = QApplication.font().pointSizeF()
+        self._base_pt = pt if pt > 0 else 10.0
+        self.ui_scale = UiScaleState(self.settings.value("ui_scale", UiScaleState.DEFAULT))
+        self._apply_scale()
+        self.zoom_shortcuts = ZoomShortcuts(self, self.zoom)  # Cmd/Ctrl + = / - / 0
+        self.focus_tracker = KeyboardFocusTracker(self)
+        self.overlay_trap = OverlayFocusTrap(lambda: self.input, self)
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -242,7 +248,7 @@ class Gadget(QWidget):
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
 
-        self.tray = QSystemTrayIcon(self)
+        self.tray = QSystemTrayIcon(make_icon(COLORS["offline"]), self)
         menu = QMenu()
         menu.addAction("Show / Hide", self.toggle_visible)
         self.tray_toggle = QAction("Start service", menu, triggered=self.toggle_service)
@@ -251,8 +257,6 @@ class Gadget(QWidget):
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
             lambda r: self.toggle_visible() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
-        self.theme.theme_changed.connect(self._apply_theme)
-        self.theme.apply()
         self.tray.show()
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
 
@@ -270,7 +274,6 @@ class Gadget(QWidget):
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        self.page_gap = self.theme.tokens().spacing.xxs
         root = QWidget(objectName="root")
         outer.addWidget(root)
         lay = QVBoxLayout(root)
@@ -280,10 +283,10 @@ class Gadget(QWidget):
         self.status_lbl = QLabel("offline")
         self.power_btn = QPushButton("Start")
         self.power_btn.clicked.connect(self.toggle_service)
-        close = QPushButton("✕")
-        close.setFixedWidth(30)
+        close = self.close_btn = QPushButton("✕")
         close.setToolTip("Hide to tray")
         close.clicked.connect(self.hide)
+        name_control(close, "Hide to tray")
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
@@ -298,17 +301,19 @@ class Gadget(QWidget):
             self.profile_cb.addItem(p.label, p.key)
         self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
         self.profile_cb.currentIndexChanged.connect(self._on_profile)
+        name_control(self.profile_cb, "Profile")
         prow.addWidget(self.profile_cb, 1)
         lay.addLayout(prow)
 
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
-        self.edit_ep_btn.setFixedSize(26, 26)
         self.edit_ep_btn.setToolTip("Edit endpoint URL")
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
+        name_control(self.edit_ep_btn, "Edit endpoint URL")
         erow.addWidget(self.endpoint_lbl, 1)
         erow.addWidget(self.edit_ep_btn)
         lay.addLayout(erow)
@@ -322,19 +327,23 @@ class Gadget(QWidget):
         self.tabs.addTab(self._history_page(), "History")
         self.tabs.addTab(self._settings_page(), "Settings")
         self.tabs.currentChanged.connect(self._on_tab)
+        name_control(self.tabs.tabBar(), "Sections")
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
+        self.db_footer.setProperty("muted", True)
         lay.addWidget(self.db_footer)
         self._update_controls()
+        label_controls(self)
 
     def _chat_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, self.page_gap, 0, 0)
+        lay.setContentsMargins(0, 4, 0, 0)
 
         self.view = ChatTranscript()
         self.view.image_requested.connect(self._preview_image)
+        name_control(self.view, "Chat transcript")
         lay.addWidget(self.view, 1)
 
         vbar = self.view.verticalScrollBar()
@@ -343,15 +352,19 @@ class Gadget(QWidget):
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
+        self.stats_lbl.setProperty("muted", True)
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
+        self.scroll_bottom_btn.setProperty("accent", True)
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
+        name_control(self.scroll_bottom_btn, "Jump to latest messages")
         self.scroll_bottom_btn.hide()
         srow.addWidget(self.stats_lbl, 1)
         srow.addWidget(self.scroll_bottom_btn)
         lay.addLayout(srow)
 
         self.gpu_lbl = QLabel("GPU: …")
+        self.gpu_lbl.setProperty("muted", True)
         lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = AttachmentStrip()
@@ -366,10 +379,10 @@ class Gadget(QWidget):
 
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter send · Ctrl+Shift+V clips)")
-        self.input.setFixedHeight(64)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
+        name_control(self.input, "Message")
         lay.addWidget(self.input)
 
         tools_row = QHBoxLayout()
@@ -409,13 +422,16 @@ class Gadget(QWidget):
         if self.profile.vision:
             self.attach_btn.setText("📎 File / 🖼 Image")
         self.attach_btn.clicked.connect(self._pick_files)
+        name_control(self.attach_btn, "Attach files")
         self.folder_btn = QPushButton("📁 Folder")
         self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
                                    "skips binaries/node_modules) — or drop a folder on the window")
         self.folder_btn.clicked.connect(self._pick_folder)
+        name_control(self.folder_btn, "Add folder context")
         self.clip_btn = QPushButton("📋 Clips")
         self.clip_btn.setToolTip("Clipboard memory (Ctrl+Shift+V)")
         self.clip_btn.clicked.connect(self._show_clip_menu)
+        name_control(self.clip_btn, "Clipboard memory")
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send)
         self.stop_btn = QPushButton('Stop')
@@ -433,11 +449,12 @@ class Gadget(QWidget):
     def _history_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, self.page_gap, 0, 0)
+        lay.setContentsMargins(0, 4, 0, 0)
         self.hist_user_lbl = QLabel()
         lay.addWidget(self.hist_user_lbl)
         self.hist_list = QListWidget()
         self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
+        name_control(self.hist_list, "Saved sessions")
         lay.addWidget(self.hist_list, 1)
         row = QHBoxLayout()
         for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
@@ -451,7 +468,7 @@ class Gadget(QWidget):
     def _settings_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, self.page_gap, 0, 0)
+        lay.setContentsMargins(0, 4, 0, 0)
 
         lay.addWidget(QLabel("<b>User name</b> (defaults to this PC's name)"))
         urow = QHBoxLayout()
@@ -459,12 +476,15 @@ class Gadget(QWidget):
         apply_u = QPushButton("Apply")
         apply_u.clicked.connect(self._apply_user)
         self.user_edit.returnPressed.connect(self._apply_user)
+        name_control(self.user_edit, "User name")
+        name_control(apply_u, "Apply user name")
         urow.addWidget(self.user_edit, 1)
         urow.addWidget(apply_u)
         lay.addLayout(urow)
 
         lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
+        name_control(self.prompt_edit, "System prompt")
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
         prow = QHBoxLayout()
@@ -472,7 +492,9 @@ class Gadget(QWidget):
         save_p.clicked.connect(self._save_prompt)
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
+        name_control(reset_p, "Reset system prompt to default")
         self.prompt_msg = QLabel()
+        self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
         prow.addWidget(reset_p)
         prow.addWidget(self.prompt_msg, 1)
@@ -486,11 +508,15 @@ class Gadget(QWidget):
         self.endpoint_edit.returnPressed.connect(self._apply_endpoint)
         reset_ep = QPushButton("Reset to default")
         reset_ep.clicked.connect(self._reset_endpoint)
+        name_control(self.endpoint_edit, "Endpoint URL")
+        name_control(apply_ep, "Apply endpoint URL")
+        name_control(reset_ep, "Reset endpoint URL to default")
         erow.addWidget(self.endpoint_edit, 1)
         erow.addWidget(apply_ep)
         erow.addWidget(reset_ep)
         lay.addLayout(erow)
         self.endpoint_msg = QLabel()
+        self.endpoint_msg.setProperty("muted", True)
         lay.addWidget(self.endpoint_msg)
 
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
@@ -503,23 +529,12 @@ class Gadget(QWidget):
         browse.clicked.connect(self._browse_db)
         default = QPushButton("Use default")
         default.clicked.connect(lambda: self._switch_db(DEFAULT_DB))
+        name_control(default, "Use default database")
         clear_clips = QPushButton("Clear clips")
         clear_clips.clicked.connect(self._clear_clips)
         for b in (browse, default, clear_clips):
             drow.addWidget(b)
         lay.addLayout(drow)
-
-        lay.addWidget(QLabel("<b>Theme</b>"))
-        trow = QHBoxLayout()
-        self.theme_cb = QComboBox()
-        for pref in ThemePreference:
-            self.theme_cb.addItem(pref.value.capitalize(), pref.value)
-        self.theme_cb.setCurrentIndex(self.theme_cb.findData(self.theme.preference().value))
-        self.theme_cb.activated.connect(self._on_theme_selected)
-        self.theme_msg = QLabel()
-        trow.addWidget(self.theme_cb)
-        trow.addWidget(self.theme_msg, 1)
-        lay.addLayout(trow)
 
         lay.addWidget(QLabel("<b>MCP Tools Configuration</b>"))
         mcp_row = QHBoxLayout()
@@ -531,13 +546,6 @@ class Gadget(QWidget):
 
         return w
 
-    def _on_theme_selected(self, index):
-        try:
-            self.theme.set_preference(self.theme_cb.itemData(index))
-            self.theme_msg.clear()
-        except ThemePersistError as e:
-            self.theme_msg.setText(f"Applied, but not saved: {e}")
-
     def _apply_gadget(self, on):
         self.settings.setValue("gadget", on)
         flags = Qt.WindowType.Window
@@ -546,6 +554,18 @@ class Gadget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, bool(on))
         self.setWindowFlags(flags)
         self.show()
+
+    def zoom(self, action):
+        self.ui_scale.apply(action)
+        self.settings.setValue("ui_scale", self.ui_scale.scale_factor)
+        self._apply_scale()
+
+    def _apply_scale(self):
+        scale = self.ui_scale.scale_factor
+        self.setStyleSheet(stylesheet(DARK_TOKENS, scale, self._base_pt))
+        self.close_btn.setFixedWidth(round(30 * scale))
+        self.edit_ep_btn.setFixedSize(round(26 * scale), round(26 * scale))
+        self.input.setFixedHeight(round(64 * scale))
 
     def toggle_visible(self):
         if self.isVisible():
@@ -654,28 +674,11 @@ class Gadget(QWidget):
             f"GPU{g['index']} {g['name']}: {g['util']}% · {g['used']}/{g['total']} MiB · {g['temp']}°C"
             for g in gpus) or "GPU: n/a")
 
-    def _apply_theme(self, _tokens=None):
-        """Re-style token-derived widgets in place after a theme change; state is untouched."""
-        a = self.theme.adapter
-        caption = a.text_style("muted", "caption")
-        for lbl in (self.endpoint_lbl, self.db_footer, self.stats_lbl, self.gpu_lbl,
-                    self.prompt_msg, self.endpoint_msg):
-            lbl.setStyleSheet(caption)
-        # caption first so the accent rule's bold weight wins
-        self.scroll_bottom_btn.setStyleSheet(
-            f"QPushButton {{ {a.font_style('caption')} }}\n" + a.accent_control_style("QPushButton"))
-        self._render_status()
-        self._render_db_status()
-
-    def _render_status(self):
-        tone = STATUS_TONES[self.state]
-        self.dot.setStyleSheet(self.theme.adapter.status_style(tone, "heading"))
-        self.tray.setIcon(make_icon(self.theme.adapter.status_color(tone)))
-
     def _set_status(self, s):
         self.state = s
-        self._render_status()
+        self.dot.setStyleSheet(f"color: {COLORS[s]}; font-size: 16px;")
         self.status_lbl.setText(s)
+        self.tray.setIcon(make_icon(COLORS[s]))
         self.tray.setToolTip(f"Llama service: {s}")
         self.power_btn.setText("Stop" if s != "offline" else "Start")
         self.tray_toggle.setText("Stop service" if s != "offline" else "Start service")
@@ -1083,6 +1086,9 @@ class Gadget(QWidget):
         row.addWidget(deny)
         row.addWidget(approve)
         layout.addLayout(row)
+        name_control(preview, "Tool call details")
+        name_control(approve, f"Approve {display_name}")
+        name_control(deny, f"Deny {display_name}")
         self._approval_dialog = dialog
         self.tool_status = f'Waiting for approval: {display_name}'
         self._schedule_render()
@@ -1428,25 +1434,18 @@ class Gadget(QWidget):
         self._refresh_db_status()
 
     def _refresh_db_status(self):
-        self._db_st = self.db.status()
-        self._render_db_status()
-
-    def _render_db_status(self):
-        st = self._db_st
-        if st is None:
-            return
-        ok_color, bad_color = (self.theme.adapter.status_color(t) for t in ("success", "error"))
+        st = self.db.status()
         name = Path(st["path"]).name
         if st["ok"]:
             kb = st["size"] / 1024
             size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
-            html = (f'<span style="color:{ok_color}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
+            html = (f'<span style="color:{DARK_TOKENS.status_success}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
                     f'{escape(st["path"])}<br>{size} · {st["sessions"]} sessions · '
                     f'{st["messages"]} messages · {st["clips"]} clips')
             self.db_footer.setText(f"DB ● {name} · {st['sessions']} sessions · {st['messages']} msgs")
         else:
             reason = st.get("error") or ("read-only" if not st.get("writable", True) else st.get("integrity"))
-            html = f'<span style="color:{bad_color}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
+            html = f'<span style="color:{DARK_TOKENS.status_error}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
             self.db_footer.setText(f"DB ✕ {name}")
         self.db_status.setText(html)
         self.db_footer.setToolTip(st["path"])

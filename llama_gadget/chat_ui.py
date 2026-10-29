@@ -4,13 +4,13 @@ import json
 import math
 import re
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
 
+from .a11y import label_controls, register_accessible_control
 from .images import decode_attachment_image
-from .theme import active_tokens, bind_theme
 
 
 def code_block(text):
@@ -37,13 +37,18 @@ class MarkdownBody(QTextBrowser):
 
     def fit_height(self):
         self.document().setTextWidth(max(50, self.viewport().width()))
-        height = math.ceil(self.document().size().height()) + active_tokens().spacing.sm
+        height = math.ceil(self.document().size().height()) + 12
         if height != self.height():
             self.setFixedHeight(height)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.fit_height()
+
+    def changeEvent(self, event):  # UI zoom changes the stylesheet font; refit the wrapped text
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange:
+            self.fit_height()
 
 
 class AttachmentStrip(QWidget):
@@ -103,6 +108,8 @@ class ImagePreviewDialog(QDialog):
         self.label = QLabel()
         self.scroll.setWidget(self.label)
         layout.addWidget(self.scroll, 1)
+        register_accessible_control(self.scroll, f"Image preview {attachment.get('name', '')}", 'image-preview')
+        label_controls(self)
         self.update_image()
 
     def update_image(self):
@@ -127,8 +134,7 @@ class MessageCard(QWidget):
         self.signature = None
         self.source = {}
         layout = QVBoxLayout(self)
-        gap = active_tokens().spacing.xxs
-        layout.setContentsMargins(0, gap, 0, gap)
+        layout.setContentsMargins(0, 4, 0, 4)
         header = QHBoxLayout()
         self.heading = QLabel()
         self.heading.setTextFormat(Qt.TextFormat.PlainText)
@@ -136,6 +142,7 @@ class MessageCard(QWidget):
         header.addWidget(self.heading, 1)
         self.copy_btn = QPushButton('Copy')
         self.copy_btn.clicked.connect(self.copy_response)
+        register_accessible_control(self.copy_btn, 'Copy response', 'copy-response')
         header.addWidget(self.copy_btn)
         layout.addLayout(header)
         self.body = MarkdownBody()
@@ -162,6 +169,7 @@ class MessageCard(QWidget):
         calls = metadata.get('tool_calls', [])
         heading = {'user': 'You', 'assistant': 'Assistant', 'tool': 'Tool result', 'context': 'Folder context'}.get(role, role)
         self.heading.setText(heading + (' · ' + message['ts'] if message.get('ts') else ''))
+        self.body.setAccessibleName('Your message' if role == 'user' else heading + ' message')
         self.copy_btn.setVisible(role == 'assistant' and bool(content))
         if role == 'tool':
             heading += ': ' + metadata.get('name', 'tool')
@@ -192,15 +200,10 @@ class ChatTranscript(QScrollArea):
         self.setWidgetResizable(True)
         container = QWidget()
         self.column = QVBoxLayout(container)
-        gap = active_tokens().spacing.xxs
-        self.column.setContentsMargins(gap, gap, gap, gap)
+        self.column.setContentsMargins(4, 4, 4, 4)
         self.column.addStretch()
         self.setWidget(container)
         self.cards = {}
-        bind_theme(self.apply_theme)
-
-    def apply_theme(self, adapter):
-        self.setStyleSheet(f"QScrollArea, QScrollArea > QWidget > QWidget {{ background: {adapter.surface('primary')}; }}")
 
     def set_messages(self, messages, live_reply='', activity='', error='', show_tools=False):
         visible = []

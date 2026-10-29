@@ -10,8 +10,9 @@ from PyQt6.QtWidgets import (
     QSplitter, QFileDialog, QWidget
 )
 
+from .a11y import label_controls, register_accessible_control
 from .mcp_config import EXAMPLE, parse_config, save_config, load_config
-from .theme import active_adapter, bind_theme
+from .theme import DARK_TOKENS
 from .tools import DEFINITIONS
 
 
@@ -45,7 +46,6 @@ class MCPConfigDialog(QDialog):
 
         self.status_lbl = QLabel()
         self.status_lbl.setWordWrap(True)
-        self._status_tone = "muted"
         lay.addWidget(self.status_lbl)
 
         btn_row = QHBoxLayout()
@@ -67,34 +67,30 @@ class MCPConfigDialog(QDialog):
         btn_row.addStretch()
         btn_row.addWidget(self.close_btn)
         lay.addLayout(btn_row)
-        bind_theme(self.apply_theme)
-
-    def apply_theme(self, adapter):
-        tone = self._status_tone
-        self.status_lbl.setStyleSheet(adapter.text_style("muted") if tone == "muted" else adapter.status_style(tone))
-
-    def _set_status(self, tone, text):
-        self._status_tone = tone
-        self.status_lbl.setText(text)
-        self.apply_theme(active_adapter())
+        register_accessible_control(self.editor, 'MCP servers configuration JSON')
+        label_controls(self)
 
     def _validate(self):
         try:
             parse_config(self.editor.toPlainText())
-            self._set_status("success", "Configuration is valid.")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_success};")
+            self.status_lbl.setText("Configuration is valid.")
             return True
         except Exception as exc:
-            self._set_status("error", f"Error: {exc}")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_error};")
+            self.status_lbl.setText(f"Error: {exc}")
             return False
 
     def _save(self):
         try:
             config = parse_config(self.editor.toPlainText())
             save_config(self.config_path, config)
-            self._set_status("success", "Configuration Saved successfully.")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_success};")
+            self.status_lbl.setText("Configuration Saved successfully.")
             self.config_saved.emit(config)
         except Exception as exc:
-            self._set_status("error", f"Error: {exc}")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_error};")
+            self.status_lbl.setText(f"Error: {exc}")
 
     def _load(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -106,19 +102,23 @@ class MCPConfigDialog(QDialog):
             content = Path(path).read_text(encoding="utf-8")
             config = parse_config(content)
             self.editor.setPlainText(json.dumps(config, indent=2))
-            self._set_status("success", f"Loaded from {Path(path).name}.")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_success};")
+            self.status_lbl.setText(f"Loaded from {Path(path).name}.")
         except Exception as exc:
-            self._set_status("error", f"Error loading file: {exc}")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_error};")
+            self.status_lbl.setText(f"Error loading file: {exc}")
 
     def _insert_example(self):
         self.editor.setPlainText(json.dumps(EXAMPLE, indent=2))
-        self._set_status("muted", "Inserted example configuration.")
+        self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.text_muted};")
+        self.status_lbl.setText("Inserted example configuration.")
 
     def set_active_turn(self, active: bool):
         self.save_btn.setEnabled(not active)
         self.load_btn.setEnabled(not active)
         if active:
-            self._set_status("muted", "Turn active. Configuration cannot be saved or loaded during a turn.")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.text_muted};")
+            self.status_lbl.setText("Turn active. Configuration cannot be saved or loaded during a turn.")
 
 
 class ToolInspectorDialog(QDialog):
@@ -176,6 +176,9 @@ class ToolInspectorDialog(QDialog):
         self.close_btn.clicked.connect(self.close)
         bottom_row.addWidget(self.close_btn)
         lay.addLayout(bottom_row)
+        register_accessible_control(self.tree, 'Tools and providers')
+        register_accessible_control(self.detail_view, 'Tool or provider details')
+        label_controls(self)
 
         self.update_snapshot((), {}, workspace=self.workspace)
 

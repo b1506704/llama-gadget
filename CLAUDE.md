@@ -41,6 +41,8 @@ Three threads cooperate: the Qt UI thread (`Gadget` in `app.py`), one `ChatWorke
 
 **Supporting modules.** `files.py` parses attachments (incl. `.docx` via zip+XML, `.pdf` via `pdftotext`/`pypdf`) and does the git-aware folder-context scan; `images.py` downscales vision attachments to ≤1568px, flattens alpha onto white, and embeds as JPEG data URLs; `chat_ui.py`/`tool_ui.py` hold dialogs and per-message widgets.
 
+**Theme & accessibility.** All colors come from `theme.py` tokens (`DARK_TOKENS`/`LIGHT_TOKENS`); `stylesheet(tokens, scale)` is set once on `Gadget` and cascades to dialogs parented to it — don't add hardcoded hex colors or per-dialog stylesheets. `tests/test_theme.py` gates every token pairing at WCAG AA (4.5:1 text, 3:1 UI/focus ring). `a11y.py` holds app-wide event filters owned by `Gadget`: `KeyboardFocusTracker` (sets the `keyboardFocus` property → focus ring, keyboard only), `OverlayFocusTrap` (auto-traps Tab in every shown `QDialog`, restores focus to the trigger or `Gadget.input`), and `ZoomShortcuts` (Cmd/Ctrl + = / - / 0 → `UiScaleState`, persisted as `ui_scale`). New interactive controls need a readable accessible name: use `register_accessible_control` for icon-only/input widgets; `accessibility_gaps` in `tests/test_a11y.py` enforces this.
+
 ## Design docs
 
 Feature specs, plans, and execution logs live in `docs/superpowers/{specs,plans,execution}/` — check the matching dated doc before extending tool calling or MCP behavior.
