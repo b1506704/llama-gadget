@@ -1,52 +1,118 @@
-"""Shared theme tokens: the only place raw colors and sizes for themed widgets are defined."""
-from dataclasses import dataclass
+"""Design token schema: the single styling contract for every surface and control."""
+import re
+from dataclasses import dataclass, fields
+
+Color = str  # opaque '#rrggbb' hex; alpha is intentionally not representable
+_HEX = re.compile(r'#[0-9a-f]{6}')
 
 
 @dataclass(frozen=True)
 class SemanticColors:
-    surface: str
-    surface_raised: str
-    border: str
-    divider: str
-    handle_hover: str
-    handle_active: str
-    focus_ring: str
-    text: str
-    text_muted: str
+    background: Color
+    surface_primary: Color
+    surface_elevated: Color
+    surface_overlay: Color
+    text_primary: Color
+    text_secondary: Color
+    text_muted: Color
+    accent: Color
+    border: Color
+    focus_ring: Color
+    status_success: Color
+    status_warning: Color
+    status_error: Color
+    status_info: Color
+
+    def __post_init__(self):
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if not isinstance(value, str) or not _HEX.fullmatch(value):
+                raise ValueError(f'{f.name} must be a lowercase opaque #rrggbb color, got {value!r}')
 
 
 @dataclass(frozen=True)
 class SpacingScale:
-    hairline: int
+    xxs: int
     xs: int
     sm: int
     md: int
+    lg: int
+    xl: int
+
+    def __post_init__(self):
+        values = [getattr(self, f.name) for f in fields(self)]
+        if any(not isinstance(v, int) or v <= 0 or v % 4 for v in values):
+            raise ValueError(f'spacing must be positive multiples of 4px, got {values}')
+
+
+@dataclass(frozen=True)
+class TypeToken:
+    family: str
+    size: int  # pixels
+    line_height: int  # pixels
+    weight: int = 400  # CSS-style weight (400 regular, 600 semibold)
+
+
+@dataclass(frozen=True)
+class TypographyScale:
+    heading: TypeToken
+    body: TypeToken
+    monospace: TypeToken
+    caption: TypeToken
 
 
 @dataclass(frozen=True)
 class CornerRadii:
-    sm: int
-    md: int
+    none: float
+    sm: float
+    md: float
+    lg: float
+    pill: float
 
 
 @dataclass(frozen=True)
 class ThemeTokens:
-    name: str
     colors: SemanticColors
     spacing: SpacingScale
+    typography: TypographyScale
     radii: CornerRadii
 
+    @property
+    def selection(self) -> str:
+        return self.colors.surface_elevated
 
-SPACING = SpacingScale(hairline=1, xs=4, sm=6, md=10)
-RADII = CornerRadii(sm=6, md=10)
+    @property
+    def selection_text(self) -> str:
+        return self.colors.text_primary
 
-# Dark mirrors the palette of the app's existing STYLE sheet.
-DARK_TOKENS = ThemeTokens('dark', SemanticColors(
-    surface='#14161a', surface_raised='#1b1e24', border='#2a2e35', divider='#23272e',
-    handle_hover='#363b44', handle_active='#2f81f7', focus_ring='#2f81f7',
-    text='#e6e8eb', text_muted='#8b949e'), SPACING, RADII)
+    @property
+    def badge(self) -> str:
+        return self.colors.surface_elevated
 
-LIGHT_TOKENS = ThemeTokens('light', SemanticColors(
-    surface='#ffffff', surface_raised='#f6f8fa', border='#d0d7de', divider='#e3e7eb',
-    handle_hover='#c4ccd5', handle_active='#0969da', focus_ring='#0969da',
-    text='#1f2328', text_muted='#59636e'), SPACING, RADII)
+    @property
+    def badge_text(self) -> str:
+        return self.colors.text_secondary
+
+    @property
+    def text_strong(self) -> str:
+        return self.colors.text_primary
+
+    @property
+    def border(self) -> str:
+        return self.colors.border
+
+    @property
+    def name(self) -> str:
+        return 'dark' if self.colors.background == '#0d1117' else 'light'
+
+
+SANS = '"Noto Sans", "Cantarell", sans-serif'
+MONO = '"JetBrains Mono", "Noto Sans Mono", monospace'
+
+DEFAULT_SPACING = SpacingScale(xxs=4, xs=8, sm=12, md=16, lg=24, xl=32)
+DEFAULT_TYPOGRAPHY = TypographyScale(
+    heading=TypeToken(SANS, 16, 22, 600),
+    body=TypeToken(SANS, 13, 18),
+    monospace=TypeToken(MONO, 12, 16),
+    caption=TypeToken(SANS, 11, 15))
+DEFAULT_RADII = CornerRadii(none=0.0, sm=4.0, md=6.0, lg=10.0, pill=999.0)

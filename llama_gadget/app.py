@@ -8,34 +8,32 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QPoint, QRect, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                             QMessageBox, QPushButton, QStackedWidget, QSystemTrayIcon, QTextBrowser,
+                             QMessageBox, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
+from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, UiScaleState, ZoomShortcuts, label_controls,
+                   register_accessible_control as name_control)
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
+from .theme import DARK_TOKENS, stylesheet
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
-from .layout import (LayoutController, LayoutPreferences, WorkspaceSplitter, default_preferences_path,
-                     load_layout_preferences, save_layout_preferences)
-from .theme import DARK_TOKENS
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
 
 DEFAULT_USER = socket.gethostname()  # PC name
-COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
-VIEWS = (("chat", "💬 Chat"), ("settings", "⚙ Settings"))  # primary-canvas views, in stack order
-PANEL_TOGGLES = {"sidebar": ("☰", "Ctrl+B", "navigation sidebar"),
-                 "inspector": ("ⓘ", "Ctrl+Alt+B", "inspector")}  # zone -> (glyph, shortcut, name)
+COLORS = {"online": DARK_TOKENS.status_success, "loading": DARK_TOKENS.status_warning,
+          "offline": DARK_TOKENS.status_error}
 
 
 def clean_endpoint(url: str) -> str:
@@ -44,23 +42,6 @@ def clean_endpoint(url: str) -> str:
         url = "http://" + url
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
-
-STYLE = """
-QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
-QLabel, QCheckBox { color: #d0d4da; }
-QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
-    border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
-QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
-QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
-QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
-QListWidget::item:selected { background: #2a3140; }
-QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
-QPushButton:hover { background: #363b44; }
-QPushButton:disabled { color: #6b7078; }
-QPushButton:checked { background: #2a3140; }
-QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
-QMenu::item:selected { background: #2a3140; }
-"""
 
 
 def make_icon(color: str) -> QIcon:
@@ -145,7 +126,6 @@ class FolderDialog(QDialog):
     def __init__(self, parent, root, files, total_seen, budget):
         super().__init__(parent)
         self.setWindowTitle(f"Folder context — {Path(root).name}")
-        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
         self.resize(460, 520)
         self.files, self.budget = files, budget
         lay = QVBoxLayout(self)
@@ -177,6 +157,8 @@ class FolderDialog(QDialog):
         row.addWidget(cancel)
         row.addWidget(ok)
         lay.addLayout(row)
+        name_control(self.list, "Files to add")
+        label_controls(self)
         self._update()
 
     def _set_all(self, st):
@@ -193,7 +175,7 @@ class FolderDialog(QDialog):
         sel = self.selected()
         chars = sum(f["chars"] for f in sel)
         over = chars > self.budget
-        color = "#f85149" if over else "#3fb950"
+        color = DARK_TOKENS.status_error if over else DARK_TOKENS.status_success
         self.info.setText(
             f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
             f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
@@ -234,12 +216,6 @@ class Gadget(QWidget):
         self.msgs = []
         self.session_id = None
         self.attachments = []
-        self._view_state = {}  # session id -> (unsent draft, scroll value or None when at bottom)
-        self.layout_controller = None
-        self.preferences_path = default_preferences_path()
-        self._layout_ready = False
-        self.panel_buttons = {}
-        self.panel_shortcuts = {}
 
         self.user = self.settings.value("user", DEFAULT_USER) or DEFAULT_USER
         self.db = Database()
@@ -253,9 +229,15 @@ class Gadget(QWidget):
 
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
+        self.resize(420, 660)
         self._build_ui()
-        self._restore_layout()
-        self.setStyleSheet(STYLE)
+        pt = QApplication.font().pointSizeF()
+        self._base_pt = pt if pt > 0 else 10.0
+        self.ui_scale = UiScaleState(self.settings.value("ui_scale", UiScaleState.DEFAULT))
+        self._apply_scale()
+        self.zoom_shortcuts = ZoomShortcuts(self, self.zoom)  # Cmd/Ctrl + = / - / 0
+        self.focus_tracker = KeyboardFocusTracker(self)
+        self.overlay_trap = OverlayFocusTrap(lambda: self.input, self)
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -277,7 +259,6 @@ class Gadget(QWidget):
             lambda r: self.toggle_visible() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
-        QApplication.instance().aboutToQuit.connect(self._save_layout)
 
         self.clipboard = QApplication.clipboard()
         self.clipboard.dataChanged.connect(self._on_clipboard)
@@ -302,157 +283,17 @@ class Gadget(QWidget):
         self.status_lbl = QLabel("offline")
         self.power_btn = QPushButton("Start")
         self.power_btn.clicked.connect(self.toggle_service)
-        close = QPushButton("✕")
-        close.setFixedWidth(30)
+        close = self.close_btn = QPushButton("✕")
         close.setToolTip("Hide to tray")
         close.clicked.connect(self.hide)
-        top.addWidget(self._panel_toggle("sidebar"))
+        name_control(close, "Hide to tray")
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
         top.addWidget(self.power_btn)
-        top.addWidget(self._panel_toggle("inspector"))
         top.addWidget(close)
         lay.addLayout(top)
 
-        # Inspector first: the chat page's control refresh reads its tool widgets.
-        inspector = self._inspector()
-        sidebar = self._sidebar()
-        self.canvas = QStackedWidget()
-        self.canvas.addWidget(self._chat_page())
-        self.canvas.addWidget(self._settings_page())
-        self.zones = WorkspaceSplitter(sidebar, self.canvas, inspector)
-        self.zones.apply_theme(DARK_TOKENS)
-        lay.addWidget(self.zones, 1)
-        self.layout_controller = LayoutController(self.zones, focus_target=self.input, parent=self)
-        self.layout_controller.layout_changed.connect(self._sync_panel_toggles)
-        self._show_view("chat")
-
-        self.db_footer = QLabel()
-        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
-        lay.addWidget(self.db_footer)
-        self._update_controls()
-
-    def _panel_toggle(self, zone):
-        """One button and one shortcut per side panel, both routed through _toggle_panel."""
-        glyph, key, name = PANEL_TOGGLES[zone]
-        button = QPushButton(glyph)
-        button.setCheckable(True)
-        button.setChecked(True)
-        button.setFixedWidth(30)
-        button.setToolTip(f"Show / hide the {name} ({key})")
-        button.clicked.connect(lambda: self._toggle_panel(zone))
-        shortcut = QShortcut(QKeySequence(key), self)
-        shortcut.activated.connect(lambda: self._toggle_panel(zone))
-        self.panel_buttons[zone], self.panel_shortcuts[zone] = button, shortcut
-        return button
-
-    def _toggle_panel(self, zone):
-        self.layout_controller.toggle_panel(zone)
-        self._sync_panel_toggles()
-
-    def _sync_panel_toggles(self):
-        for zone, button in self.panel_buttons.items():
-            button.setChecked(not self.layout_controller.is_panel_collapsed(zone))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if self.layout_controller is not None:
-            self.layout_controller.evaluate_viewport(e.size().width())
-            self._sync_panel_toggles()
-        self._schedule_layout_save()
-
-    def moveEvent(self, e):
-        super().moveEvent(e)
-        self._schedule_layout_save()
-
-    def closeEvent(self, e):
-        self._save_layout()
-        super().closeEvent(e)
-
-    # ---------------------------------------------------------------- layout persistence
-    def _restore_layout(self):
-        """Apply saved geometry and panels before the first show; fall back to a centred default."""
-        prefs = load_layout_preferences(self.preferences_path)
-        if prefs.window_x is not None and not self._on_a_screen(prefs):
-            prefs = LayoutPreferences()  # saved position is off every display: start fresh
-        if prefs.window_x is None:
-            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-            area = screen.availableGeometry() if screen else QRect(0, 0, prefs.window_width, prefs.window_height)
-            width, height = min(prefs.window_width, area.width()), min(prefs.window_height, area.height())
-            self.resize(width, height)
-            self.move(area.center() - QPoint(width // 2, height // 2))
-        else:
-            self.resize(prefs.window_width, prefs.window_height)
-            self.move(prefs.window_x, prefs.window_y)
-        self.layout_controller.restore(
-            {"sidebar": prefs.sidebar_width, "inspector": prefs.inspector_width},
-            {"sidebar": prefs.sidebar_collapsed, "inspector": prefs.inspector_collapsed})
-        self.layout_controller.evaluate_viewport(self.width())
-        self._sync_panel_toggles()
-        self._layout_save_timer = QTimer(self, singleShot=True, interval=500, timeout=self._save_layout)
-        self.layout_controller.layout_changed.connect(self._schedule_layout_save)
-        self._layout_ready = True
-
-    @staticmethod
-    def _on_a_screen(prefs):
-        rect = QRect(prefs.window_x, prefs.window_y, prefs.window_width, prefs.window_height)
-        # Enough of the window must be visible to grab and move it.
-        return any(min(r.width(), r.height()) >= 48 for r in
-                   (s.availableGeometry().intersected(rect) for s in QApplication.screens()))
-
-    def _layout_snapshot(self):
-        """Expanded widths and the user's own collapsed choices, never compact mode's transient ones."""
-        c = self.layout_controller
-        return LayoutPreferences(
-            window_width=self.width(), window_height=self.height(), window_x=self.x(), window_y=self.y(),
-            sidebar_width=c.panel_width("sidebar"), inspector_width=c.panel_width("inspector"),
-            sidebar_collapsed=c.user_collapsed["sidebar"], inspector_collapsed=c.user_collapsed["inspector"])
-
-    def _schedule_layout_save(self):
-        if self._layout_ready:
-            self._layout_save_timer.start()  # debounced: drags and resizes write once they settle
-
-    def _save_layout(self):
-        if not self._layout_ready:
-            return
-        self._layout_save_timer.stop()
-        try:
-            save_layout_preferences(self._layout_snapshot(), self.preferences_path)
-        except OSError:
-            pass  # a read-only config dir must not break the window
-
-    def _sidebar(self):
-        """Navigation & session zone: canvas views plus this user's sessions."""
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        self.nav = QListWidget()
-        self.nav.setSizeAdjustPolicy(QListWidget.SizeAdjustPolicy.AdjustToContents)
-        for key, label in VIEWS:
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, key)
-            self.nav.addItem(item)
-        self.nav.currentRowChanged.connect(self._on_nav)
-        lay.addWidget(self.nav)
-        self.hist_user_lbl = QLabel()
-        lay.addWidget(self.hist_user_lbl)
-        self.hist_list = QListWidget()
-        self.hist_list.itemClicked.connect(lambda _: self._open_selected())
-        lay.addWidget(self.hist_list, 1)
-        row = QHBoxLayout()
-        for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
-                         ("Refresh", self._refresh_history)):
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            row.addWidget(b)
-        lay.addLayout(row)
-        return w
-
-    def _inspector(self):
-        """Contextual inspector & model drawer: profile, endpoint, GPUs, tool options."""
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("<b>Model</b>"))
         prow = QHBoxLayout()
         prow.addWidget(QLabel("Profile"))
         self.profile_cb = QComboBox()
@@ -460,71 +301,40 @@ class Gadget(QWidget):
             self.profile_cb.addItem(p.label, p.key)
         self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
         self.profile_cb.currentIndexChanged.connect(self._on_profile)
+        name_control(self.profile_cb, "Profile")
         prow.addWidget(self.profile_cb, 1)
         lay.addLayout(prow)
 
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
-        self.endpoint_lbl.setWordWrap(True)
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
-        self.edit_ep_btn.setFixedSize(26, 26)
         self.edit_ep_btn.setToolTip("Edit endpoint URL")
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
+        name_control(self.edit_ep_btn, "Edit endpoint URL")
         erow.addWidget(self.endpoint_lbl, 1)
         erow.addWidget(self.edit_ep_btn)
         lay.addLayout(erow)
 
-        self.gpu_lbl = QLabel("GPU: …")
-        self.gpu_lbl.setWordWrap(True)
-        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
-        lay.addWidget(self.gpu_lbl)
-
-        lay.addWidget(QLabel("<b>Tools</b>"))
-        self.tools_cb = QCheckBox('Enable tools')
-        self.tools_cb.setToolTip('Agent profiles only. Reads/listings auto-run in the workspace; writes and bash require approval.')
-        self.tools_cb.toggled.connect(lambda _: self._update_controls())
-        lay.addWidget(self.tools_cb)
-        tools_row = QHBoxLayout()
-        self.workspace_btn = QPushButton('Workspace…')
-        self.workspace_btn.clicked.connect(self._pick_workspace)
-        self.tools_btn = QPushButton('Tools…')
-        self.tools_btn.clicked.connect(self._show_tools_inspector)
-        tools_row.addWidget(self.workspace_btn)
-        tools_row.addWidget(self.tools_btn)
-        lay.addLayout(tools_row)
-        self.show_tools_cb = QCheckBox('Show tool details')
-        self.show_tools_cb.setChecked(self.settings.value('show_tool_details', False, bool))
-        self.show_tools_cb.toggled.connect(self._toggle_tool_details)
-        self.yolo_cb = QCheckBox('YOLO mode')
-        self.yolo_cb.setToolTip('Auto-approve all tool calls (bash commands, file writes, MCP) without prompting')
-        self.yolo_cb.setChecked(self.settings.value('yolo_mode', False, bool))
-        self.yolo_cb.toggled.connect(self._toggle_yolo_mode)
-        lay.addWidget(self.show_tools_cb)
-        lay.addWidget(self.yolo_cb)
-        self.workspace_lbl = QLabel('Select a workspace to enable tools')
-        self.workspace_lbl.setWordWrap(True)
-        lay.addWidget(self.workspace_lbl)
-
-        lay.addWidget(QLabel("<b>Window</b>"))
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
         self.gadget_cb.toggled.connect(self._apply_gadget)
         lay.addWidget(self.gadget_cb)
-        lay.addStretch()
-        return w
 
-    def _show_view(self, key):
-        self.nav.setCurrentRow(next(i for i, (k, _) in enumerate(VIEWS) if k == key))
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._chat_page(), "Chat")
+        self.tabs.addTab(self._history_page(), "History")
+        self.tabs.addTab(self._settings_page(), "Settings")
+        self.tabs.currentChanged.connect(self._on_tab)
+        name_control(self.tabs.tabBar(), "Sections")
+        lay.addWidget(self.tabs, 1)
 
-    def _on_nav(self, row):
-        if row < 0:
-            return
-        # Switching the stacked canvas keeps each page's widgets, so drafts and scroll survive.
-        self.canvas.setCurrentIndex(row)
-        if VIEWS[row][0] == "settings":
-            self._refresh_db_status()
+        self.db_footer = QLabel()
+        self.db_footer.setProperty("muted", True)
+        lay.addWidget(self.db_footer)
+        self._update_controls()
+        label_controls(self)
 
     def _chat_page(self):
         w = QWidget()
@@ -533,6 +343,7 @@ class Gadget(QWidget):
 
         self.view = ChatTranscript()
         self.view.image_requested.connect(self._preview_image)
+        name_control(self.view, "Chat transcript")
         lay.addWidget(self.view, 1)
 
         vbar = self.view.verticalScrollBar()
@@ -541,17 +352,20 @@ class Gadget(QWidget):
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
-        self.stats_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.stats_lbl.setProperty("muted", True)
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
-        self.scroll_bottom_btn.setStyleSheet(
-            "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
-            "padding: 2px 8px; font-size: 11px;")
+        self.scroll_bottom_btn.setProperty("accent", True)
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
+        name_control(self.scroll_bottom_btn, "Jump to latest messages")
         self.scroll_bottom_btn.hide()
         srow.addWidget(self.stats_lbl, 1)
         srow.addWidget(self.scroll_bottom_btn)
         lay.addLayout(srow)
+
+        self.gpu_lbl = QLabel("GPU: …")
+        self.gpu_lbl.setProperty("muted", True)
+        lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = AttachmentStrip()
         self.attach_lbl.image_requested.connect(self._preview_image)
@@ -565,11 +379,39 @@ class Gadget(QWidget):
 
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter send · Ctrl+Shift+V clips)")
-        self.input.setFixedHeight(64)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
+        name_control(self.input, "Message")
         lay.addWidget(self.input)
+
+        tools_row = QHBoxLayout()
+        self.tools_cb = QCheckBox('Enable tools')
+        self.tools_cb.setToolTip('Agent profiles only. Reads/listings auto-run in the workspace; writes and bash require approval.')
+        self.tools_cb.toggled.connect(lambda _: self._update_controls())
+        self.workspace_btn = QPushButton('Workspace…')
+        self.workspace_btn.clicked.connect(self._pick_workspace)
+        self.tools_btn = QPushButton('Tools…')
+        self.tools_btn.clicked.connect(self._show_tools_inspector)
+        tools_row.addWidget(self.tools_cb)
+        tools_row.addWidget(self.workspace_btn)
+        tools_row.addWidget(self.tools_btn)
+        lay.addLayout(tools_row)
+        options_row = QHBoxLayout()
+        self.show_tools_cb = QCheckBox('Show tool details')
+        self.show_tools_cb.setChecked(self.settings.value('show_tool_details', False, bool))
+        self.show_tools_cb.toggled.connect(self._toggle_tool_details)
+        self.yolo_cb = QCheckBox('YOLO mode')
+        self.yolo_cb.setToolTip('Auto-approve all tool calls (bash commands, file writes, MCP) without prompting')
+        self.yolo_cb.setChecked(self.settings.value('yolo_mode', False, bool))
+        self.yolo_cb.toggled.connect(self._toggle_yolo_mode)
+        options_row.addWidget(self.show_tools_cb)
+        options_row.addWidget(self.yolo_cb)
+        options_row.addStretch()
+        lay.addLayout(options_row)
+        self.workspace_lbl = QLabel('Select a workspace to enable tools')
+        self.workspace_lbl.setWordWrap(True)
+        lay.addWidget(self.workspace_lbl)
 
         row = QHBoxLayout()
         self.refresh_btn = QPushButton("New session")
@@ -580,13 +422,16 @@ class Gadget(QWidget):
         if self.profile.vision:
             self.attach_btn.setText("📎 File / 🖼 Image")
         self.attach_btn.clicked.connect(self._pick_files)
+        name_control(self.attach_btn, "Attach files")
         self.folder_btn = QPushButton("📁 Folder")
         self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
                                    "skips binaries/node_modules) — or drop a folder on the window")
         self.folder_btn.clicked.connect(self._pick_folder)
+        name_control(self.folder_btn, "Add folder context")
         self.clip_btn = QPushButton("📋 Clips")
         self.clip_btn.setToolTip("Clipboard memory (Ctrl+Shift+V)")
         self.clip_btn.clicked.connect(self._show_clip_menu)
+        name_control(self.clip_btn, "Clipboard memory")
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send)
         self.stop_btn = QPushButton('Stop')
@@ -601,6 +446,25 @@ class Gadget(QWidget):
         self._update_stats()
         return w
 
+    def _history_page(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 4, 0, 0)
+        self.hist_user_lbl = QLabel()
+        lay.addWidget(self.hist_user_lbl)
+        self.hist_list = QListWidget()
+        self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
+        name_control(self.hist_list, "Saved sessions")
+        lay.addWidget(self.hist_list, 1)
+        row = QHBoxLayout()
+        for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
+                         ("Refresh", self._refresh_history)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        return w
+
     def _settings_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -612,12 +476,15 @@ class Gadget(QWidget):
         apply_u = QPushButton("Apply")
         apply_u.clicked.connect(self._apply_user)
         self.user_edit.returnPressed.connect(self._apply_user)
+        name_control(self.user_edit, "User name")
+        name_control(apply_u, "Apply user name")
         urow.addWidget(self.user_edit, 1)
         urow.addWidget(apply_u)
         lay.addLayout(urow)
 
         lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
+        name_control(self.prompt_edit, "System prompt")
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
         prow = QHBoxLayout()
@@ -625,8 +492,9 @@ class Gadget(QWidget):
         save_p.clicked.connect(self._save_prompt)
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
+        name_control(reset_p, "Reset system prompt to default")
         self.prompt_msg = QLabel()
-        self.prompt_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
         prow.addWidget(reset_p)
         prow.addWidget(self.prompt_msg, 1)
@@ -640,12 +508,15 @@ class Gadget(QWidget):
         self.endpoint_edit.returnPressed.connect(self._apply_endpoint)
         reset_ep = QPushButton("Reset to default")
         reset_ep.clicked.connect(self._reset_endpoint)
+        name_control(self.endpoint_edit, "Endpoint URL")
+        name_control(apply_ep, "Apply endpoint URL")
+        name_control(reset_ep, "Reset endpoint URL to default")
         erow.addWidget(self.endpoint_edit, 1)
         erow.addWidget(apply_ep)
         erow.addWidget(reset_ep)
         lay.addLayout(erow)
         self.endpoint_msg = QLabel()
-        self.endpoint_msg.setStyleSheet("color:#8b949e; font-size:11px;")
+        self.endpoint_msg.setProperty("muted", True)
         lay.addWidget(self.endpoint_msg)
 
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
@@ -658,6 +529,7 @@ class Gadget(QWidget):
         browse.clicked.connect(self._browse_db)
         default = QPushButton("Use default")
         default.clicked.connect(lambda: self._switch_db(DEFAULT_DB))
+        name_control(default, "Use default database")
         clear_clips = QPushButton("Clear clips")
         clear_clips.clicked.connect(self._clear_clips)
         for b in (browse, default, clear_clips):
@@ -682,6 +554,18 @@ class Gadget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, bool(on))
         self.setWindowFlags(flags)
         self.show()
+
+    def zoom(self, action):
+        self.ui_scale.apply(action)
+        self.settings.setValue("ui_scale", self.ui_scale.scale_factor)
+        self._apply_scale()
+
+    def _apply_scale(self):
+        scale = self.ui_scale.scale_factor
+        self.setStyleSheet(stylesheet(DARK_TOKENS, scale, self._base_pt))
+        self.close_btn.setFixedWidth(round(30 * scale))
+        self.edit_ep_btn.setFixedSize(round(26 * scale), round(26 * scale))
+        self.input.setFixedHeight(round(64 * scale))
 
     def toggle_visible(self):
         if self.isVisible():
@@ -712,7 +596,7 @@ class Gadget(QWidget):
         self._add_files([p for p in paths if not Path(p).is_dir()])
         for d in (p for p in paths if Path(p).is_dir()):
             self._add_folder(d)
-        self._show_view("chat")
+        self.tabs.setCurrentIndex(0)
 
     # ---------------------------------------------------------------- service / stats
     def current_base_url(self) -> str:
@@ -1155,7 +1039,6 @@ class Gadget(QWidget):
             worker.decide(call_id, True)
             return
         dialog = QDialog(self)
-        dialog.setStyleSheet('QDialog { background: #14161a; }')
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.resize(620, 420)
         layout = QVBoxLayout(dialog)
@@ -1203,6 +1086,9 @@ class Gadget(QWidget):
         row.addWidget(deny)
         row.addWidget(approve)
         layout.addLayout(row)
+        name_control(preview, "Tool call details")
+        name_control(approve, f"Approve {display_name}")
+        name_control(deny, f"Deny {display_name}")
         self._approval_dialog = dialog
         self.tool_status = f'Waiting for approval: {display_name}'
         self._schedule_render()
@@ -1321,7 +1207,6 @@ class Gadget(QWidget):
         self.msgs, self.session_id = [], None
         self.reply, self.tool_status = '', ''
         self.ctx_used, self.ctx_exact, self.last_speed, self.last_error = 0, True, "", ""
-        self._highlight_session()
         self._update_controls()
         self._update_stats()
         self._render()
@@ -1432,6 +1317,12 @@ class Gadget(QWidget):
         self._refresh_db_status()
 
     # ---------------------------------------------------------------- history
+    def _on_tab(self, i):
+        if i == 1:
+            self._refresh_history()
+        elif i == 2:
+            self._refresh_db_status()
+
     def _refresh_history(self):
         self.hist_user_lbl.setText(f"Sessions for <b>{escape(self.user)}</b>")
         self.hist_list.clear()
@@ -1440,17 +1331,6 @@ class Gadget(QWidget):
                                    f"{fmt_ts(updated)} · {n} messages · started {fmt_ts(created)}")
             item.setData(Qt.ItemDataRole.UserRole, sid)
             self.hist_list.addItem(item)
-        self._highlight_session()
-
-    def _highlight_session(self):
-        """Mark the active session in the navigation sidebar."""
-        self.hist_list.clearSelection()
-        for i in range(self.hist_list.count()):
-            item = self.hist_list.item(i)
-            active = item.data(Qt.ItemDataRole.UserRole) == self.session_id
-            item.setText(("▶ " if active else "") + item.text().removeprefix("▶ "))
-            if active:
-                self.hist_list.setCurrentItem(item)
 
     def _selected_sid(self):
         it = self.hist_list.currentItem()
@@ -1460,28 +1340,13 @@ class Gadget(QWidget):
         sid = self._selected_sid()
         if sid is None:
             return
-        if sid == self.session_id:
-            self._show_view("chat")
-            return
         if self.worker:
             self._pending_action = lambda: self._load_session(sid)
             self.stop_turn()
             return
         self._load_session(sid)
 
-    def _remember_view(self):
-        bar = self.view.verticalScrollBar()
-        at_bottom = bar.value() >= bar.maximum() - 48
-        self._view_state[self.session_id] = (self.input.toPlainText(), None if at_bottom else bar.value())
-
-    def _restore_view(self, sid):
-        draft, scroll = self._view_state.pop(sid, ("", None))
-        self.input.setPlainText(draft)
-        bar = self.view.verticalScrollBar()
-        bar.setValue(bar.maximum() if scroll is None else min(scroll, bar.maximum()))
-
     def _load_session(self, sid):
-        self._remember_view()
         self.new_session()
         self.session_id = sid
         self.msgs = self.db.load_messages(sid)
@@ -1490,9 +1355,8 @@ class Gadget(QWidget):
         self.ctx_exact = False
         self._update_stats()
         self._render()
-        self._show_view("chat")
-        self._highlight_session()
-        self._restore_view(sid)
+        self.tabs.setCurrentIndex(0)
+        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
 
     def _delete_selected(self):
         sid = self._selected_sid()
@@ -1575,13 +1439,13 @@ class Gadget(QWidget):
         if st["ok"]:
             kb = st["size"] / 1024
             size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
-            html = (f'<span style="color:#3fb950">● Connected</span> · integrity {st["integrity"]} · writable<br>'
+            html = (f'<span style="color:{DARK_TOKENS.status_success}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
                     f'{escape(st["path"])}<br>{size} · {st["sessions"]} sessions · '
                     f'{st["messages"]} messages · {st["clips"]} clips')
             self.db_footer.setText(f"DB ● {name} · {st['sessions']} sessions · {st['messages']} msgs")
         else:
             reason = st.get("error") or ("read-only" if not st.get("writable", True) else st.get("integrity"))
-            html = f'<span style="color:#f85149">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
+            html = f'<span style="color:{DARK_TOKENS.status_error}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
             self.db_footer.setText(f"DB ✕ {name}")
         self.db_status.setText(html)
         self.db_footer.setToolTip(st["path"])
