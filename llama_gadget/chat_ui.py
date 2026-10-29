@@ -4,8 +4,8 @@ import json
 import math
 import re
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap
+from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QIcon, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel,
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -15,6 +15,40 @@ from .images import decode_attachment_image
 def code_block(text):
     fence = '`' * max(3, max((len(s) for s in re.findall(r'`+', text)), default=0) + 1)
     return f'{fence}\n{text}\n{fence}'
+
+
+class TokenFrameCoalescer(QObject):
+    """Batches streamed chunks so the UI does at most one append + scroll pass per frame.
+
+    The single-shot timer only runs while chunks are buffered, so an idle window has no
+    timer overhead. ``flushed`` fires once per non-empty flush with the joined text."""
+    flushed = pyqtSignal(str)
+
+    def __init__(self, interval_ms: int = 16, parent=None):
+        super().__init__(parent)
+        self._chunks = []
+        self.timer = QTimer(self, interval=interval_ms, singleShot=True)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)  # coarse timers may fire up to 5% early
+        self.timer.timeout.connect(self.flush)
+
+    def enqueue(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self._chunks.append(chunk)
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def flush(self) -> str:
+        self.timer.stop()
+        if not self._chunks:
+            return ''
+        text, self._chunks = ''.join(self._chunks), []
+        self.flushed.emit(text)
+        return text
+
+    def stop(self) -> None:
+        """Drain anything still buffered (stream completion), then leave the timer idle."""
+        self.flush()
 
 
 class MarkdownBody(QTextBrowser):
@@ -35,7 +69,9 @@ class MarkdownBody(QTextBrowser):
             QDesktopServices.openUrl(url)
 
     def fit_height(self):
-        self.document().setTextWidth(max(50, self.viewport().width()))
+        width = max(50, self.viewport().width())
+        if self.document().textWidth() != width:  # re-setting the same width relayouts everything
+            self.document().setTextWidth(width)
         height = math.ceil(self.document().size().height()) + 12
         if height != self.height():
             self.setFixedHeight(height)
@@ -150,6 +186,16 @@ class MessageCard(QWidget):
         self.copy_btn.setText('Copied')
         self.copy_timer.start()
 
+    def append_text(self, text):
+        # Incremental append: only the touched block is laid out, no Markdown re-parse.
+        cursor = QTextCursor(self.body.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.source = dict(self.source, content=self.source.get('content', '') + text)
+        self.signature = (dict(self.source), self.signature[1])
+        self.copy_btn.setVisible(self.source.get('role') == 'assistant')
+        self.body.setVisible(True)
+
     def update_message(self, message, show_tools):
         signature = (message, show_tools)
         if self.signature == signature:
@@ -178,7 +224,10 @@ class MessageCard(QWidget):
             content += '\n\nTool requests\n\n' + code_block(json.dumps(calls, indent=2, ensure_ascii=False))
         elif role == 'user':
             content = content.replace('\n', '  \n')
-        self.body.setMarkdown(content)
+        if message.get('streaming'):
+            self.body.setPlainText(content)
+        else:
+            self.body.setMarkdown(content)
         self.body.setVisible(bool(content))
         self.attachments.set_attachments(message.get('attachments', []) if role != 'context' else [])
 
@@ -205,8 +254,11 @@ class ChatTranscript(QScrollArea):
             if message['role'] == 'assistant' and message.get('metadata', {}).get('tool_calls') and not show_tools and not message['content']:
                 continue
             visible.append((('saved', message.get('id', index)), message))
-        if live_reply or activity:
-            visible.append(('live', dict(role='assistant' if live_reply else 'notice', content=live_reply or activity)))
+        if live_reply:
+            # Plain text while streaming so frames can append incrementally (see append_live).
+            visible.append(('live', dict(role='assistant', content=live_reply, streaming=True)))
+        elif activity:
+            visible.append(('live', dict(role='notice', content=activity)))
         if error:
             visible.append(('error', dict(role='notice', content='Error: ' + error)))
         if not visible:
@@ -230,6 +282,18 @@ class ChatTranscript(QScrollArea):
                 self.column.insertWidget(index, card)
             card.update_message(message, show_tools)
         self.column.activate()
+
+    def append_live(self, text):
+        """Append streamed text to the live reply card; False when a full render is needed."""
+        card = self.cards.get('live')
+        if card is None or not card.source.get('streaming'):
+            return False
+        card.append_text(text)
+        # Apply the resulting geometry now so the caller's scroll pass sees the new range.
+        card.layout().activate()
+        self.column.activate()
+        QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+        return True
 
     def toPlainText(self):
         return '\n\n'.join(self.column.itemAt(i).widget().body.toPlainText()

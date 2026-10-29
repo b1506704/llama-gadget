@@ -2,13 +2,12 @@ import json
 import re
 import socket
 import sys
-import threading
 import time
 from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
@@ -17,12 +16,13 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
 
 from . import profiles, service
 from .chat import ChatWorker
-from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
+from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog, TokenFrameCoalescer
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
+from .workers import WorkerQueue
 from .db import DEFAULT_DB, Database
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
@@ -103,14 +103,6 @@ def model_content(m: dict, vision: bool):
             a["name"] for a in imgs) + "]"
     return [{"type": "text", "text": text or "Analyze the attached image(s)."}] + [
         {"type": "image_url", "image_url": {"url": a["data"]}} for a in imgs]
-
-
-class Bridge(QObject):
-    status = pyqtSignal(str)
-    gpus = pyqtSignal(list)
-    ctx = pyqtSignal(object)
-    model = pyqtSignal(object)
-    error = pyqtSignal(str)
 
 
 class InputBox(QTextEdit):
@@ -225,6 +217,7 @@ class Gadget(QWidget):
         self.reply = ""
         self._ntok = 0
         self._render_pending = False
+        self._follow_tail = True
         self._drag = None
         self._busy_toggle = False
         self.msgs = []
@@ -247,12 +240,11 @@ class Gadget(QWidget):
         self._build_ui()
         self.setStyleSheet(STYLE)
 
-        self.bridge = Bridge()
-        self.bridge.status.connect(self._set_status)
-        self.bridge.gpus.connect(self._set_gpus)
-        self.bridge.model.connect(self._set_model)
-        self.bridge.error.connect(lambda m: QMessageBox.warning(self, 'Profile error', m))
-        self.bridge.ctx.connect(lambda n: setattr(self, "n_ctx", n or self.n_ctx))
+        # Blocking systemctl / HTTP / nvidia-smi calls run on background QThreads.
+        self.jobs = WorkerQueue(self)
+        # Streamed tokens reach the transcript at most once per 16ms frame.
+        self.token_coalescer = TokenFrameCoalescer(parent=self)
+        self.token_coalescer.flushed.connect(self._on_token_frame)
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
 
@@ -624,20 +616,28 @@ class Gadget(QWidget):
             self._set_endpoint(text.strip())
 
     def _poll(self):
-        prof = self.profile
-        base_url = self.current_base_url()
+        if self._shutting_down:
+            return
+        job = self.jobs.submit(self._poll_job, self.current_base_url(), self.profile.unit, not self.n_ctx)
+        job.signals.progress_emitted.connect(self._on_poll_progress)
 
-        def job():
-            st = service.status(base_url, prof.unit)
-            self.bridge.status.emit(st)
-            self.bridge.gpus.emit(service.gpu_stats())
-            if st == "offline":
-                self.bridge.model.emit(None)
-                return
-            if not self.n_ctx:
-                self.bridge.ctx.emit(service.n_ctx(base_url))
-            self.bridge.model.emit(service.model_info(base_url))
-        threading.Thread(target=job, daemon=True).start()
+    @staticmethod
+    def _poll_job(base_url, unit, need_ctx):
+        st = service.status(base_url, unit)
+        yield {"status": st}
+        yield {"gpus": service.gpu_stats()}
+        if st == "offline":
+            yield {"model": None}
+            return
+        if need_ctx:
+            yield {"ctx": service.n_ctx(base_url)}
+        yield {"model": service.model_info(base_url)}
+
+    def _on_poll_progress(self, update):
+        handlers = {"status": self._set_status, "gpus": self._set_gpus, "model": self._set_model,
+                    "ctx": lambda n: setattr(self, "n_ctx", n or self.n_ctx)}
+        for key, value in update.items():
+            handlers[key](value)
 
     def _set_model(self, info):
         if not info:
@@ -695,43 +695,59 @@ class Gadget(QWidget):
             return
         prof = self.profile
         want_stop = self.state != "offline"
-        if not want_stop:
-            conflicts = profiles.active_conflicts(prof)
-            if conflicts:
-                names = "\n".join(f"• {c.label}" for c in conflicts)
-                if QMessageBox.question(
-                        self, "Switch profile",
-                        f"Starting “{prof.label}” needs the GPU/port used by:\n{names}\n\nThey will be stopped. Continue?"
-                ) != QMessageBox.StandardButton.Yes:
-                    return
         self._busy_toggle = True
         self.power_btn.setEnabled(False)
         self.status_lbl.setText("stopping…" if want_stop else "starting…")
+        if want_stop:
+            self._submit_toggle(prof, True)
+            return
+        # systemctl is-active can take seconds per conflict; never probe on the GUI thread.
+        job = self.jobs.submit(profiles.active_conflicts, prof)
+        job.signals.job_completed.connect(lambda conflicts: self._confirm_start(prof, conflicts))
+        job.signals.job_failed.connect(lambda exc: self._toggle_done(prof, None, str(exc)))
 
-        def job():
-            err = ""
-            try:
-                if want_stop:
-                    profiles.stop(prof)
-                    # dual-GPU profiles parked the always-on tier: bring it back
-                    if prof.key in ("vision", "agent-27b") and self.settings.value("parked_services", False, bool):
-                        self.settings.setValue("parked_services", False)
-                        profiles.start(profiles.PROFILES["services"])
-                else:
-                    for c in profiles.active_conflicts(prof):
-                        if prof.key in ("vision", "agent-27b") and c.key == "services":
-                            self.settings.setValue("parked_services", True)
-                        profiles.stop(c)
-                    if prof.key == "services":
-                        self.settings.setValue("parked_services", False)
-                    profiles.start(prof)
-            except Exception as e:  # noqa: BLE001
-                err = str(e)
-            self._busy_toggle = False
-            self.bridge.status.emit(service.status(self.current_base_url(), prof.unit))
-            if err:
-                self.bridge.error.emit(f"{prof.label}: {err}")
-        threading.Thread(target=job, daemon=True).start()
+    def _confirm_start(self, prof, conflicts):
+        if conflicts:
+            names = "\n".join(f"• {c.label}" for c in conflicts)
+            if QMessageBox.question(
+                    self, "Switch profile",
+                    f"Starting “{prof.label}” needs the GPU/port used by:\n{names}\n\nThey will be stopped. Continue?"
+            ) != QMessageBox.StandardButton.Yes:
+                self._toggle_done(prof, None, "")
+                return
+        self._submit_toggle(prof, False)
+
+    def _submit_toggle(self, prof, want_stop):
+        job = self.jobs.submit(self._toggle_job, prof, want_stop, self.current_base_url())
+        job.signals.job_completed.connect(lambda result: self._toggle_done(prof, *result))
+        job.signals.job_failed.connect(lambda exc: self._toggle_done(prof, None, str(exc)))
+
+    def _toggle_job(self, prof, want_stop, base_url):
+        err = ""
+        try:
+            if want_stop:
+                profiles.stop(prof)
+                # dual-GPU profiles parked the always-on tier: bring it back
+                if prof.key in ("vision", "agent-27b") and self.settings.value("parked_services", False, bool):
+                    self.settings.setValue("parked_services", False)
+                    profiles.start(profiles.PROFILES["services"])
+            else:
+                for c in profiles.active_conflicts(prof):
+                    if prof.key in ("vision", "agent-27b") and c.key == "services":
+                        self.settings.setValue("parked_services", True)
+                    profiles.stop(c)
+                if prof.key == "services":
+                    self.settings.setValue("parked_services", False)
+                profiles.start(prof)
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        return service.status(base_url, prof.unit), err
+
+    def _toggle_done(self, prof, status, err):
+        self._busy_toggle = False
+        self._set_status(status or self.state)
+        if err:
+            QMessageBox.warning(self, 'Profile error', f"{prof.label}: {err}")
 
     def _update_stats(self):
         turns = sum(1 for m in self.msgs if m["role"] == "user")
@@ -882,6 +898,8 @@ class Gadget(QWidget):
     def _on_scroll(self, val):
         bar = self.view.verticalScrollBar()
         at_bottom = (val >= bar.maximum() - 48) if bar.maximum() > 0 else True
+        # Content growth never changes the value, so this only flips on real scrolling.
+        self._follow_tail = at_bottom
         if hasattr(self, "scroll_bottom_btn"):
             self.scroll_bottom_btn.setVisible(not at_bottom and bar.maximum() > 60)
 
@@ -1084,6 +1102,7 @@ class Gadget(QWidget):
         self._schedule_render()
 
     def _on_exchange(self, exchange):
+        self.token_coalescer.stop()
         self._turn_has_exchange = True
         try:
             self.msgs.extend(self.db.add_exchange(self.session_id, exchange))
@@ -1100,6 +1119,7 @@ class Gadget(QWidget):
         self._schedule_render()
 
     def _on_message(self, message):
+        self.token_coalescer.stop()
         try:
             self.msgs.extend(self.db.add_exchange(self.session_id, [message]))
         except Exception as exc:
@@ -1109,14 +1129,23 @@ class Gadget(QWidget):
         self.reply = ''
 
     def _on_token(self, t):
-        self.reply += t
+        self.token_coalescer.enqueue(t)
         self._ntok += 1
         if self._ntok == 1:
             self._t0 = time.monotonic()
         elif self._ntok % 5 == 0:
             self.last_speed = f"Gen: {(self._ntok - 1) / max(time.monotonic() - self._t0, 1e-6):.1f} tok/s (live)"
             self._update_stats()
-        self._schedule_render()
+
+    def _on_token_frame(self, text):
+        # One incremental append and at most one scroll pass per 16ms frame. Auto-scroll
+        # only follows when the user is already at the bottom (scrolling up pauses it).
+        self.reply += text
+        bar = self.view.verticalScrollBar()
+        if not self.view.append_live(text):
+            self._render()
+        elif self._follow_tail and not bar.isSliderDown():
+            bar.setValue(bar.maximum())
 
     def _finish(self):
         self.tool_status = ''
@@ -1129,6 +1158,7 @@ class Gadget(QWidget):
         self._finish()
 
     def _on_fail(self, err):
+        self.token_coalescer.stop()
         self.last_error = err
         if not self._turn_has_exchange and self.msgs and self.msgs[-1]['role'] == 'user':
             last = self.msgs.pop()
@@ -1140,6 +1170,7 @@ class Gadget(QWidget):
         self._finish()
 
     def _on_cancelled(self):
+        self.token_coalescer.stop()
         if not self.last_error:
             self.last_error = 'Turn stopped. Completed tool results were kept.'
         self.reply = ''
@@ -1165,10 +1196,12 @@ class Gadget(QWidget):
     def _shutdown_workers(self):
         self._shutting_down = True
         self._pending_action = None
+        self.timer.stop()
         self.stop_turn()
         for worker in list(self._workers):
             worker.cancel()
             worker.wait()
+        self.jobs.shutdown()
         if self.mcp_manager is not None:
             self.mcp_manager.close()
             self.mcp_manager = None
