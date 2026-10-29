@@ -10,7 +10,9 @@ from PyQt6.QtWidgets import (
     QSplitter, QFileDialog, QWidget
 )
 
+from .a11y import label_controls, register_accessible_control
 from .mcp_config import EXAMPLE, parse_config, save_config, load_config
+from .theme import DARK_TOKENS
 from .tools import DEFINITIONS
 
 
@@ -65,15 +67,17 @@ class MCPConfigDialog(QDialog):
         btn_row.addStretch()
         btn_row.addWidget(self.close_btn)
         lay.addLayout(btn_row)
+        register_accessible_control(self.editor, 'MCP servers configuration JSON')
+        label_controls(self)
 
     def _validate(self):
         try:
             parse_config(self.editor.toPlainText())
-            self.status_lbl.setStyleSheet("color: #2ea043;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_success};")
             self.status_lbl.setText("Configuration is valid.")
             return True
         except Exception as exc:
-            self.status_lbl.setStyleSheet("color: #f85149;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_error};")
             self.status_lbl.setText(f"Error: {exc}")
             return False
 
@@ -81,11 +85,11 @@ class MCPConfigDialog(QDialog):
         try:
             config = parse_config(self.editor.toPlainText())
             save_config(self.config_path, config)
-            self.status_lbl.setStyleSheet("color: #2ea043;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_success};")
             self.status_lbl.setText("Configuration Saved successfully.")
             self.config_saved.emit(config)
         except Exception as exc:
-            self.status_lbl.setStyleSheet("color: #f85149;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_error};")
             self.status_lbl.setText(f"Error: {exc}")
 
     def _load(self):
@@ -98,22 +102,22 @@ class MCPConfigDialog(QDialog):
             content = Path(path).read_text(encoding="utf-8")
             config = parse_config(content)
             self.editor.setPlainText(json.dumps(config, indent=2))
-            self.status_lbl.setStyleSheet("color: #2ea043;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_success};")
             self.status_lbl.setText(f"Loaded from {Path(path).name}.")
         except Exception as exc:
-            self.status_lbl.setStyleSheet("color: #f85149;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.status_error};")
             self.status_lbl.setText(f"Error loading file: {exc}")
 
     def _insert_example(self):
         self.editor.setPlainText(json.dumps(EXAMPLE, indent=2))
-        self.status_lbl.setStyleSheet("color: #8b949e;")
+        self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.text_muted};")
         self.status_lbl.setText("Inserted example configuration.")
 
     def set_active_turn(self, active: bool):
         self.save_btn.setEnabled(not active)
         self.load_btn.setEnabled(not active)
         if active:
-            self.status_lbl.setStyleSheet("color: #8b949e;")
+            self.status_lbl.setStyleSheet(f"color: {DARK_TOKENS.text_muted};")
             self.status_lbl.setText("Turn active. Configuration cannot be saved or loaded during a turn.")
 
 
@@ -172,6 +176,9 @@ class ToolInspectorDialog(QDialog):
         self.close_btn.clicked.connect(self.close)
         bottom_row.addWidget(self.close_btn)
         lay.addLayout(bottom_row)
+        register_accessible_control(self.tree, 'Tools and providers')
+        register_accessible_control(self.detail_view, 'Tool or provider details')
+        label_controls(self)
 
         self.update_snapshot((), {}, workspace=self.workspace)
 

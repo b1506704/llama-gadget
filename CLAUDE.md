@@ -39,9 +39,9 @@ Three threads cooperate: the Qt UI thread (`Gadget` in `app.py`), one `ChatWorke
 
 **Persistence** (`db.py`): SQLite at repo root (`llama_gadget.db`, gitignored). Tables: `users` (system prompt keyed by hostname), `sessions`, `messages` (with `attachments` and `metadata` JSON), `clips` (50-entry clipboard ring buffer).
 
-**Keyboard layer.** `shortcuts.py` holds the single `ActionRegistry` (`CommandSpec` = id/title/category/chords/context/scope/handler); `register_primary_actions` wires it to `Gadget` methods and every other surface (QShortcuts, `command_palette.py`, the cheat sheet) derives from it — add new commands there, not as ad-hoc `keyPressEvent`s. Chords are written with `Cmd`, which always resolves to Qt `CTRL` (Qt maps that to ⌘ on macOS). `ShortcutPriorityFilter` (app-wide event filter) lets global chords beat text-widget bindings and handles the bare `?` trigger. `theme.py` holds dark/light `ThemeTokens`, the app stylesheet built from them, and `ThemeController` (persisted in QSettings).
-
 **Supporting modules.** `files.py` parses attachments (incl. `.docx` via zip+XML, `.pdf` via `pdftotext`/`pypdf`) and does the git-aware folder-context scan; `images.py` downscales vision attachments to ≤1568px, flattens alpha onto white, and embeds as JPEG data URLs; `chat_ui.py`/`tool_ui.py` hold dialogs and per-message widgets.
+
+**Theme & accessibility.** All colors come from `theme.py` tokens (`DARK_TOKENS`/`LIGHT_TOKENS`); `stylesheet(tokens, scale)` is set once on `Gadget` and cascades to dialogs parented to it — don't add hardcoded hex colors or per-dialog stylesheets. `tests/test_theme.py` gates every token pairing at WCAG AA (4.5:1 text, 3:1 UI/focus ring). `a11y.py` holds app-wide event filters owned by `Gadget`: `KeyboardFocusTracker` (sets the `keyboardFocus` property → focus ring, keyboard only), `OverlayFocusTrap` (auto-traps Tab in every shown `QDialog`, restores focus to the trigger or `Gadget.input`), and `ZoomShortcuts` (Cmd/Ctrl + = / - / 0 → `UiScaleState`, persisted as `ui_scale`). New interactive controls need a readable accessible name: use `register_accessible_control` for icon-only/input widgets; `accessibility_gaps` in `tests/test_a11y.py` enforces this.
 
 ## Design docs
 

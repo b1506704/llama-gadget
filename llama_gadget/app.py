@@ -15,24 +15,25 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
                              QMessageBox, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
                              QTextEdit, QVBoxLayout, QWidget)
 
-from . import profiles, service, theme
+from . import profiles, service
+from .a11y import (KeyboardFocusTracker, OverlayFocusTrap, UiScaleState, ZoomShortcuts, label_controls,
+                   register_accessible_control as name_control)
 from .chat import ChatWorker
 from .chat_ui import ChatTranscript, AttachmentStrip, ImagePreviewDialog
+from .theme import DARK_TOKENS, stylesheet
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
 from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
-from .shortcuts import (ActionRegistry, ShortcutCheatSheetDialog, ShortcutPriorityFilter, install_list_wrap,
-                        register_primary_actions, set_tab_chain)
-from .command_palette import CommandPaletteDialog, MRUHistoryTracker, PaletteItem
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
 
 DEFAULT_USER = socket.gethostname()  # PC name
-COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
+COLORS = {"online": DARK_TOKENS.status_success, "loading": DARK_TOKENS.status_warning,
+          "offline": DARK_TOKENS.status_error}
 
 
 def clean_endpoint(url: str) -> str:
@@ -41,8 +42,6 @@ def clean_endpoint(url: str) -> str:
         url = "http://" + url
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
-
-STYLE = theme.stylesheet(theme.DARK)
 
 
 def make_icon(color: str) -> QIcon:
@@ -144,7 +143,6 @@ class FolderDialog(QDialog):
             item.setCheckState(Qt.CheckState.Checked if fits else Qt.CheckState.Unchecked)
             self.list.addItem(item)
         self.list.itemChanged.connect(self._update)
-        install_list_wrap(self.list)
         lay.addWidget(self.list, 1)
         self.total_seen = total_seen
         row = QHBoxLayout()
@@ -159,6 +157,8 @@ class FolderDialog(QDialog):
         row.addWidget(cancel)
         row.addWidget(ok)
         lay.addLayout(row)
+        name_control(self.list, "Files to add")
+        label_controls(self)
         self._update()
 
     def _set_all(self, st):
@@ -175,7 +175,7 @@ class FolderDialog(QDialog):
         sel = self.selected()
         chars = sum(f["chars"] for f in sel)
         over = chars > self.budget
-        color = "#f85149" if over else "#3fb950"
+        color = DARK_TOKENS.status_error if over else DARK_TOKENS.status_success
         self.info.setText(
             f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
             f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
@@ -230,19 +230,14 @@ class Gadget(QWidget):
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
         self.resize(420, 660)
-        self.theme = theme.ThemeController(self.settings, self)
         self._build_ui()
-        self._apply_theme(self.theme.tokens)
-        self.theme.changed.connect(self._apply_theme)
-        self.actions = register_primary_actions(ActionRegistry(), self)
-        self._shortcuts = (self.actions.bind_shortcuts(self)
-                           + self.actions.bind_shortcuts(self.chat_page, scope='chat'))
-        self._shortcut_filter = ShortcutPriorityFilter(self.actions, self, self.show_shortcut_cheat_sheet)
-        QApplication.instance().installEventFilter(self._shortcut_filter)
-        self.palette_mru = MRUHistoryTracker()
-        self._palette = None
-        self._cheat_sheet = None
-        self._transcript_focus = None
+        pt = QApplication.font().pointSizeF()
+        self._base_pt = pt if pt > 0 else 10.0
+        self.ui_scale = UiScaleState(self.settings.value("ui_scale", UiScaleState.DEFAULT))
+        self._apply_scale()
+        self.zoom_shortcuts = ZoomShortcuts(self, self.zoom)  # Cmd/Ctrl + = / - / 0
+        self.focus_tracker = KeyboardFocusTracker(self)
+        self.overlay_trap = OverlayFocusTrap(lambda: self.input, self)
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -270,7 +265,6 @@ class Gadget(QWidget):
 
         self._poll()
         self._render()
-        self._apply_focus_order()
         self._refresh_history()
         self._refresh_db_status()
         self.gadget_cb.setChecked(self.settings.value("gadget", False, bool))
@@ -289,23 +283,16 @@ class Gadget(QWidget):
         self.status_lbl = QLabel("offline")
         self.power_btn = QPushButton("Start")
         self.power_btn.clicked.connect(self.toggle_service)
-        self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedWidth(30)
-        self.close_btn.setToolTip("Hide to tray")
-        self.close_btn.clicked.connect(self.hide)
+        close = self.close_btn = QPushButton("✕")
+        close.setToolTip("Hide to tray")
+        close.clicked.connect(self.hide)
+        name_control(close, "Hide to tray")
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
         top.addWidget(self.power_btn)
-        top.addWidget(self.close_btn)
+        top.addWidget(close)
         lay.addLayout(top)
-
-        # Collapsible sidebar panel (Cmd+B): profile, endpoint and window mode.
-        self.sidebar = QWidget()
-        side = QVBoxLayout(self.sidebar)
-        side.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.sidebar)
-        self.sidebar.setVisible(self.settings.value("sidebar_visible", True, bool))
 
         prow = QHBoxLayout()
         prow.addWidget(QLabel("Profile"))
@@ -314,8 +301,9 @@ class Gadget(QWidget):
             self.profile_cb.addItem(p.label, p.key)
         self.profile_cb.setCurrentIndex(self.profile_cb.findData(self.profile.key))
         self.profile_cb.currentIndexChanged.connect(self._on_profile)
+        name_control(self.profile_cb, "Profile")
         prow.addWidget(self.profile_cb, 1)
-        side.addLayout(prow)
+        lay.addLayout(prow)
 
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
@@ -323,29 +311,30 @@ class Gadget(QWidget):
         self.endpoint_lbl.setProperty("muted", True)
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
-        self.edit_ep_btn.setFixedSize(26, 26)
         self.edit_ep_btn.setToolTip("Edit endpoint URL")
         self.edit_ep_btn.clicked.connect(self._prompt_edit_endpoint)
+        name_control(self.edit_ep_btn, "Edit endpoint URL")
         erow.addWidget(self.endpoint_lbl, 1)
         erow.addWidget(self.edit_ep_btn)
-        side.addLayout(erow)
+        lay.addLayout(erow)
 
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
         self.gadget_cb.toggled.connect(self._apply_gadget)
-        side.addWidget(self.gadget_cb)
+        lay.addWidget(self.gadget_cb)
 
         self.tabs = QTabWidget()
-        self.chat_page = self._chat_page()
-        self.tabs.addTab(self.chat_page, "Chat")
+        self.tabs.addTab(self._chat_page(), "Chat")
         self.tabs.addTab(self._history_page(), "History")
         self.tabs.addTab(self._settings_page(), "Settings")
         self.tabs.currentChanged.connect(self._on_tab)
+        name_control(self.tabs.tabBar(), "Sections")
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
         self.db_footer.setProperty("muted", True)
         lay.addWidget(self.db_footer)
         self._update_controls()
+        label_controls(self)
 
     def _chat_page(self):
         w = QWidget()
@@ -354,6 +343,7 @@ class Gadget(QWidget):
 
         self.view = ChatTranscript()
         self.view.image_requested.connect(self._preview_image)
+        name_control(self.view, "Chat transcript")
         lay.addWidget(self.view, 1)
 
         vbar = self.view.verticalScrollBar()
@@ -364,11 +354,10 @@ class Gadget(QWidget):
         self.stats_lbl = QLabel()
         self.stats_lbl.setProperty("muted", True)
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
-        self.scroll_bottom_btn.setStyleSheet(
-            "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
-            "padding: 2px 8px; font-size: 11px;")
+        self.scroll_bottom_btn.setProperty("accent", True)
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
+        name_control(self.scroll_bottom_btn, "Jump to latest messages")
         self.scroll_bottom_btn.hide()
         srow.addWidget(self.stats_lbl, 1)
         srow.addWidget(self.scroll_bottom_btn)
@@ -390,11 +379,10 @@ class Gadget(QWidget):
 
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter send · Ctrl+Shift+V clips)")
-        self.input.setFixedHeight(64)
-        self.input.setTabChangesFocus(True)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
+        name_control(self.input, "Message")
         lay.addWidget(self.input)
 
         tools_row = QHBoxLayout()
@@ -434,13 +422,16 @@ class Gadget(QWidget):
         if self.profile.vision:
             self.attach_btn.setText("📎 File / 🖼 Image")
         self.attach_btn.clicked.connect(self._pick_files)
+        name_control(self.attach_btn, "Attach files")
         self.folder_btn = QPushButton("📁 Folder")
         self.folder_btn.setToolTip("Add a folder's text files as context for this session (git-aware, "
                                    "skips binaries/node_modules) — or drop a folder on the window")
         self.folder_btn.clicked.connect(self._pick_folder)
+        name_control(self.folder_btn, "Add folder context")
         self.clip_btn = QPushButton("📋 Clips")
         self.clip_btn.setToolTip("Clipboard memory (Ctrl+Shift+V)")
         self.clip_btn.clicked.connect(self._show_clip_menu)
+        name_control(self.clip_btn, "Clipboard memory")
         self.send_btn = QPushButton("Send")
         self.send_btn.clicked.connect(self.send)
         self.stop_btn = QPushButton('Stop')
@@ -451,9 +442,6 @@ class Gadget(QWidget):
         row.addWidget(self.send_btn)
         row.addWidget(self.stop_btn)
         lay.addLayout(row)
-        self._chat_chain = [self.scroll_bottom_btn, self.attach_clear, self.input, self.tools_cb,
-                            self.workspace_btn, self.tools_btn, self.show_tools_cb, self.yolo_cb, self.refresh_btn,
-                            self.attach_btn, self.folder_btn, self.clip_btn, self.send_btn, self.stop_btn]
         self._update_controls()
         self._update_stats()
         return w
@@ -465,17 +453,15 @@ class Gadget(QWidget):
         self.hist_user_lbl = QLabel()
         lay.addWidget(self.hist_user_lbl)
         self.hist_list = QListWidget()
-        self.hist_list.itemActivated.connect(lambda _: self._open_selected())  # double-click or Enter
-        install_list_wrap(self.hist_list)
+        self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
+        name_control(self.hist_list, "Saved sessions")
         lay.addWidget(self.hist_list, 1)
         row = QHBoxLayout()
-        self._history_chain = [self.hist_list]
         for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
                          ("Refresh", self._refresh_history)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
-            self._history_chain.append(b)
         lay.addLayout(row)
         return w
 
@@ -490,13 +476,15 @@ class Gadget(QWidget):
         apply_u = QPushButton("Apply")
         apply_u.clicked.connect(self._apply_user)
         self.user_edit.returnPressed.connect(self._apply_user)
+        name_control(self.user_edit, "User name")
+        name_control(apply_u, "Apply user name")
         urow.addWidget(self.user_edit, 1)
         urow.addWidget(apply_u)
         lay.addLayout(urow)
 
         lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
-        self.prompt_edit.setTabChangesFocus(True)
+        name_control(self.prompt_edit, "System prompt")
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
         prow = QHBoxLayout()
@@ -504,6 +492,7 @@ class Gadget(QWidget):
         save_p.clicked.connect(self._save_prompt)
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
+        name_control(reset_p, "Reset system prompt to default")
         self.prompt_msg = QLabel()
         self.prompt_msg.setProperty("muted", True)
         prow.addWidget(save_p)
@@ -519,6 +508,9 @@ class Gadget(QWidget):
         self.endpoint_edit.returnPressed.connect(self._apply_endpoint)
         reset_ep = QPushButton("Reset to default")
         reset_ep.clicked.connect(self._reset_endpoint)
+        name_control(self.endpoint_edit, "Endpoint URL")
+        name_control(apply_ep, "Apply endpoint URL")
+        name_control(reset_ep, "Reset endpoint URL to default")
         erow.addWidget(self.endpoint_edit, 1)
         erow.addWidget(apply_ep)
         erow.addWidget(reset_ep)
@@ -537,6 +529,7 @@ class Gadget(QWidget):
         browse.clicked.connect(self._browse_db)
         default = QPushButton("Use default")
         default.clicked.connect(lambda: self._switch_db(DEFAULT_DB))
+        name_control(default, "Use default database")
         clear_clips = QPushButton("Clear clips")
         clear_clips.clicked.connect(self._clear_clips)
         for b in (browse, default, clear_clips):
@@ -550,8 +543,6 @@ class Gadget(QWidget):
         mcp_row.addWidget(mcp_btn)
         mcp_row.addStretch()
         lay.addLayout(mcp_row)
-        self._settings_chain = [self.user_edit, apply_u, self.prompt_edit, save_p, reset_p, self.endpoint_edit,
-                                apply_ep, reset_ep, browse, default, clear_clips, mcp_btn]
 
         return w
 
@@ -563,6 +554,18 @@ class Gadget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, bool(on))
         self.setWindowFlags(flags)
         self.show()
+
+    def zoom(self, action):
+        self.ui_scale.apply(action)
+        self.settings.setValue("ui_scale", self.ui_scale.scale_factor)
+        self._apply_scale()
+
+    def _apply_scale(self):
+        scale = self.ui_scale.scale_factor
+        self.setStyleSheet(stylesheet(DARK_TOKENS, scale, self._base_pt))
+        self.close_btn.setFixedWidth(round(30 * scale))
+        self.edit_ep_btn.setFixedSize(round(26 * scale), round(26 * scale))
+        self.input.setFixedHeight(round(64 * scale))
 
     def toggle_visible(self):
         if self.isVisible():
@@ -594,113 +597,6 @@ class Gadget(QWidget):
         for d in (p for p in paths if Path(p).is_dir()):
             self._add_folder(d)
         self.tabs.setCurrentIndex(0)
-
-    # ---------------------------------------------------------------- keyboard actions
-    def _apply_theme(self, tokens):
-        self.setStyleSheet(theme.stylesheet(tokens))
-        self.view.setStyleSheet(theme.transcript_stylesheet(tokens))
-
-    def _apply_focus_order(self):
-        """Tab / Shift+Tab follow the visual layout: header, sidebar, tabs, then the page top to bottom."""
-        cards = self._transcript_cards()
-        transcript = [w for card in cards for w in (card.copy_btn, card.body)]
-        self._transcript_focus = tuple(map(id, cards))
-        set_tab_chain([self.power_btn, self.close_btn, self.profile_cb, self.edit_ep_btn, self.gadget_cb,
-                       self.tabs.tabBar(), *transcript, *self._chat_chain, *self._history_chain,
-                       *self._settings_chain])
-
-    def _transcript_cards(self):
-        return [self.view.column.itemAt(i).widget() for i in range(self.view.column.count() - 1)]
-
-    def show_shortcut_cheat_sheet(self):
-        if self._cheat_sheet is not None:
-            return
-        self._cheat_sheet = ShortcutCheatSheetDialog(self.actions, self.theme.tokens, self)
-        try:
-            self._cheat_sheet.exec_and_restore_focus()
-        finally:
-            self._cheat_sheet.deleteLater()
-            self._cheat_sheet = None
-
-    def palette_items(self):
-        items = [PaletteItem(spec.id, spec.title, spec.category, self.actions.hint(spec.id),
-                             lambda i=spec.id: self.actions.dispatch(i))
-                 for spec in self.actions if spec.id != 'app.command_palette' and spec.handler is not None]
-        items += [PaletteItem(f'model:{p.key}', f'Switch model: {p.label}', 'Models',
-                              'current' if p.key == self.profile.key else '',
-                              lambda k=p.key: self.select_model(k))
-                  for p in profiles.PROFILES.values()]
-        return items
-
-    def open_command_palette(self):
-        if self._palette is not None:
-            return None
-        self._palette = CommandPaletteDialog(self.palette_items(), self.theme.tokens, self.palette_mru, self)
-        try:
-            return self._palette.exec_and_restore_focus(self)
-        finally:
-            self._palette.deleteLater()
-            self._palette = None
-
-    def cycle_model(self, step):
-        n = self.profile_cb.count()
-        if n:
-            self.profile_cb.setCurrentIndex((self.profile_cb.currentIndex() + step) % n)
-
-    def select_model(self, key):
-        i = self.profile_cb.findData(key)
-        if i >= 0:
-            self.profile_cb.setCurrentIndex(i)
-
-    def show_tab(self, index):
-        self.tabs.setCurrentIndex(index)
-        page = self.tabs.currentWidget()
-        focused = QApplication.focusWidget()
-        if focused is not None and page.isAncestorOf(focused):
-            return
-        chain = (self._chat_chain, self._history_chain, self._settings_chain)[index]
-        for w in chain:  # first focusable control on the page, in Tab order
-            if w.isVisibleTo(page) and w.isEnabled():
-                w.setFocus(Qt.FocusReason.ShortcutFocusReason)
-                return
-
-    def focus_prompt(self):
-        self.show_tab(0)
-        self.input.setFocus(Qt.FocusReason.ShortcutFocusReason)
-
-    def focus_parameters(self):
-        self.show_tab(0)
-        for w in (self.tools_cb, self.show_tools_cb, self.yolo_cb):
-            if w.isEnabled():
-                w.setFocus(Qt.FocusReason.ShortcutFocusReason)
-                return
-
-    def clear_chat(self):
-        self.input.clear()
-        self._clear_attachments()
-        self.new_session()
-
-    def copy_last_response(self):
-        for m in reversed(self.msgs):
-            if m['role'] == 'assistant' and m.get('content'):
-                QApplication.clipboard().setText(m['content'])
-                return True
-        return False
-
-    def toggle_sidebar(self):
-        self.sidebar.setVisible(not self.sidebar.isVisible())
-        self.settings.setValue("sidebar_visible", self.sidebar.isVisible())
-
-    def toggle_tool_panel(self):
-        dialog = self._tools_inspector_dialog
-        if dialog is not None and dialog.isVisible():
-            dialog.hide()
-        else:
-            self._show_tools_inspector()
-
-    def toggle_tools_enabled(self):
-        if self.tools_cb.isEnabled():
-            self.tools_cb.toggle()
 
     # ---------------------------------------------------------------- service / stats
     def current_base_url(self) -> str:
@@ -930,7 +826,6 @@ class Gadget(QWidget):
             self._tools_inspector_dialog = ToolInspectorDialog(workspace=self.workspace, parent=self)
             self._tools_inspector_dialog.refresh_requested.connect(self._on_mcp_refresh)
             self._tools_inspector_dialog.disconnect_requested.connect(self._on_mcp_disconnect)
-            self._tool_shortcuts = self.actions.bind_shortcuts(self._tools_inspector_dialog, scope='tools')
         self._tools_inspector_dialog.set_active_turn(self.worker is not None)
         tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
@@ -971,8 +866,6 @@ class Gadget(QWidget):
         self.view.set_messages(self.msgs, live_reply=self.reply if self.worker else '',
                                activity=(self.tool_status or '…') if self.worker else '',
                                error=self.last_error, show_tools=self.show_tools_cb.isChecked())
-        if self._transcript_focus is not None and self._transcript_focus != tuple(map(id, self._transcript_cards())):
-            self._apply_focus_order()  # new message cards join the Tab chain in transcript order
 
         if stick:
             bar.setValue(bar.maximum())
@@ -1193,6 +1086,9 @@ class Gadget(QWidget):
         row.addWidget(deny)
         row.addWidget(approve)
         layout.addLayout(row)
+        name_control(preview, "Tool call details")
+        name_control(approve, f"Approve {display_name}")
+        name_control(deny, f"Deny {display_name}")
         self._approval_dialog = dialog
         self.tool_status = f'Waiting for approval: {display_name}'
         self._schedule_render()
@@ -1543,13 +1439,13 @@ class Gadget(QWidget):
         if st["ok"]:
             kb = st["size"] / 1024
             size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
-            html = (f'<span style="color:#3fb950">● Connected</span> · integrity {st["integrity"]} · writable<br>'
+            html = (f'<span style="color:{DARK_TOKENS.status_success}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
                     f'{escape(st["path"])}<br>{size} · {st["sessions"]} sessions · '
                     f'{st["messages"]} messages · {st["clips"]} clips')
             self.db_footer.setText(f"DB ● {name} · {st['sessions']} sessions · {st['messages']} msgs")
         else:
             reason = st.get("error") or ("read-only" if not st.get("writable", True) else st.get("integrity"))
-            html = f'<span style="color:#f85149">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
+            html = f'<span style="color:{DARK_TOKENS.status_error}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
             self.db_footer.setText(f"DB ✕ {name}")
         self.db_status.setText(html)
         self.db_footer.setToolTip(st["path"])
