@@ -8,13 +8,29 @@ from .controller import (SystemAppearance, ThemeController, ThemePreference,
 from .store import (JsonThemePreferenceStore, ThemePersistError, ThemePreferenceStore,
                     default_preferences_path)
 from .runtime import ThemeManager
-from .current import (active_adapter, active_tokens, bind_theme, set_active_adapter,
-                      theme_hub)
+from .current import (active_adapter, active_tokens, bind_theme, default_preferences_path,
+                      set_active_adapter, theme_hub)
 
-__all__ = ['Color', 'CornerRadii', 'DARK_TOKENS', 'DEFAULT_RADII', 'DEFAULT_SPACING',
-           'DEFAULT_TYPOGRAPHY', 'JsonThemePreferenceStore', 'LIGHT_TOKENS', 'SemanticColors',
-           'SpacingScale', 'SystemAppearance', 'ThemeAdapter', 'ThemeController', 'ThemeManager',
-           'ThemePersistError', 'ThemePreference', 'ThemePreferenceStore', 'ThemeTokens',
-           'TypeToken', 'TypographyScale', 'appearance_from_color_scheme',
+DARK = DARK_TOKENS
+LIGHT = LIGHT_TOKENS
+
+
+def stylesheet(tokens=None):
+    from .adapter import ThemeAdapter
+    toks = tokens or active_tokens()
+    return ThemeAdapter(toks).app_stylesheet()
+
+
+def toggle():
+    hub = theme_hub()
+    if hub is not None:
+        hub.toggle()
+
+
+__all__ = ['Color', 'CornerRadii', 'DARK_TOKENS', 'JsonThemePreferenceStore', 'LIGHT_TOKENS',
+           'SemanticColors', 'SpacingScale', 'SystemAppearance', 'ThemeAdapter', 'ThemeController',
+           'ThemeManager', 'ThemePersistError', 'ThemePreference', 'ThemePreferenceStore',
+           'ThemeTokens', 'TypeToken', 'TypographyScale', 'appearance_from_color_scheme',
            'active_adapter', 'active_tokens', 'bind_theme', 'default_preferences_path',
-           'detect_system_appearance', 'set_active_adapter', 'theme_hub']
+           'detect_system_appearance', 'set_active_adapter', 'theme_hub',
+           'DARK', 'LIGHT', 'stylesheet', 'toggle']

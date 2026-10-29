@@ -77,6 +77,34 @@ class ThemeTokens:
     typography: TypographyScale
     radii: CornerRadii
 
+    @property
+    def selection(self) -> str:
+        return self.colors.surface_elevated
+
+    @property
+    def selection_text(self) -> str:
+        return self.colors.text_primary
+
+    @property
+    def badge(self) -> str:
+        return self.colors.surface_elevated
+
+    @property
+    def badge_text(self) -> str:
+        return self.colors.text_secondary
+
+    @property
+    def text_strong(self) -> str:
+        return self.colors.text_primary
+
+    @property
+    def border(self) -> str:
+        return self.colors.border
+
+    @property
+    def name(self) -> str:
+        return 'dark' if self.colors.background == '#0d1117' else 'light'
+
 
 SANS = '"Noto Sans", "Cantarell", sans-serif'
 MONO = '"JetBrains Mono", "Noto Sans Mono", monospace'
