@@ -8,8 +8,8 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PyQt6.QtCore import QObject, QPoint, QRect, QSettings, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                              QMessageBox, QPushButton, QStackedWidget, QSystemTrayIcon, QTextBrowser,
@@ -24,7 +24,8 @@ from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
-from .layout import LayoutController, WorkspaceSplitter
+from .layout import (LayoutController, LayoutPreferences, WorkspaceSplitter, default_preferences_path,
+                     load_layout_preferences, save_layout_preferences)
 from .theme import DARK_TOKENS
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
@@ -235,6 +236,8 @@ class Gadget(QWidget):
         self.attachments = []
         self._view_state = {}  # session id -> (unsent draft, scroll value or None when at bottom)
         self.layout_controller = None
+        self.preferences_path = default_preferences_path()
+        self._layout_ready = False
         self.panel_buttons = {}
         self.panel_shortcuts = {}
 
@@ -250,8 +253,8 @@ class Gadget(QWidget):
 
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
-        self.resize(1120, 720)
         self._build_ui()
+        self._restore_layout()
         self.setStyleSheet(STYLE)
 
         self.bridge = Bridge()
@@ -274,6 +277,7 @@ class Gadget(QWidget):
             lambda r: self.toggle_visible() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
+        QApplication.instance().aboutToQuit.connect(self._save_layout)
 
         self.clipboard = QApplication.clipboard()
         self.clipboard.dataChanged.connect(self._on_clipboard)
@@ -356,6 +360,67 @@ class Gadget(QWidget):
         if self.layout_controller is not None:
             self.layout_controller.evaluate_viewport(e.size().width())
             self._sync_panel_toggles()
+        self._schedule_layout_save()
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._schedule_layout_save()
+
+    def closeEvent(self, e):
+        self._save_layout()
+        super().closeEvent(e)
+
+    # ---------------------------------------------------------------- layout persistence
+    def _restore_layout(self):
+        """Apply saved geometry and panels before the first show; fall back to a centred default."""
+        prefs = load_layout_preferences(self.preferences_path)
+        if prefs.window_x is not None and not self._on_a_screen(prefs):
+            prefs = LayoutPreferences()  # saved position is off every display: start fresh
+        if prefs.window_x is None:
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            area = screen.availableGeometry() if screen else QRect(0, 0, prefs.window_width, prefs.window_height)
+            width, height = min(prefs.window_width, area.width()), min(prefs.window_height, area.height())
+            self.resize(width, height)
+            self.move(area.center() - QPoint(width // 2, height // 2))
+        else:
+            self.resize(prefs.window_width, prefs.window_height)
+            self.move(prefs.window_x, prefs.window_y)
+        self.layout_controller.restore(
+            {"sidebar": prefs.sidebar_width, "inspector": prefs.inspector_width},
+            {"sidebar": prefs.sidebar_collapsed, "inspector": prefs.inspector_collapsed})
+        self.layout_controller.evaluate_viewport(self.width())
+        self._sync_panel_toggles()
+        self._layout_save_timer = QTimer(self, singleShot=True, interval=500, timeout=self._save_layout)
+        self.layout_controller.layout_changed.connect(self._schedule_layout_save)
+        self._layout_ready = True
+
+    @staticmethod
+    def _on_a_screen(prefs):
+        rect = QRect(prefs.window_x, prefs.window_y, prefs.window_width, prefs.window_height)
+        # Enough of the window must be visible to grab and move it.
+        return any(min(r.width(), r.height()) >= 48 for r in
+                   (s.availableGeometry().intersected(rect) for s in QApplication.screens()))
+
+    def _layout_snapshot(self):
+        """Expanded widths and the user's own collapsed choices, never compact mode's transient ones."""
+        c = self.layout_controller
+        return LayoutPreferences(
+            window_width=self.width(), window_height=self.height(), window_x=self.x(), window_y=self.y(),
+            sidebar_width=c.panel_width("sidebar"), inspector_width=c.panel_width("inspector"),
+            sidebar_collapsed=c.user_collapsed["sidebar"], inspector_collapsed=c.user_collapsed["inspector"])
+
+    def _schedule_layout_save(self):
+        if self._layout_ready:
+            self._layout_save_timer.start()  # debounced: drags and resizes write once they settle
+
+    def _save_layout(self):
+        if not self._layout_ready:
+            return
+        self._layout_save_timer.stop()
+        try:
+            save_layout_preferences(self._layout_snapshot(), self.preferences_path)
+        except OSError:
+            pass  # a read-only config dir must not break the window
 
     def _sidebar(self):
         """Navigation & session zone: canvas views plus this user's sessions."""
