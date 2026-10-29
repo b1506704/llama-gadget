@@ -9,7 +9,7 @@ from html import escape
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                              QMessageBox, QPushButton, QStackedWidget, QSystemTrayIcon, QTextBrowser,
@@ -24,7 +24,7 @@ from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
-from .layout import WorkspaceSplitter
+from .layout import LayoutController, WorkspaceSplitter
 from .theme import DARK_TOKENS
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
@@ -33,6 +33,8 @@ from .files import (UnsupportedFile, build_folder_context, parse_file, read_cand
 DEFAULT_USER = socket.gethostname()  # PC name
 COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
 VIEWS = (("chat", "💬 Chat"), ("settings", "⚙ Settings"))  # primary-canvas views, in stack order
+PANEL_TOGGLES = {"sidebar": ("☰", "Ctrl+B", "navigation sidebar"),
+                 "inspector": ("ⓘ", "Ctrl+Alt+B", "inspector")}  # zone -> (glyph, shortcut, name)
 
 
 def clean_endpoint(url: str) -> str:
@@ -54,6 +56,7 @@ QListWidget::item:selected { background: #2a3140; }
 QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
 QPushButton:hover { background: #363b44; }
 QPushButton:disabled { color: #6b7078; }
+QPushButton:checked { background: #2a3140; }
 QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
 QMenu::item:selected { background: #2a3140; }
 """
@@ -231,6 +234,9 @@ class Gadget(QWidget):
         self.session_id = None
         self.attachments = []
         self._view_state = {}  # session id -> (unsent draft, scroll value or None when at bottom)
+        self.layout_controller = None
+        self.panel_buttons = {}
+        self.panel_shortcuts = {}
 
         self.user = self.settings.value("user", DEFAULT_USER) or DEFAULT_USER
         self.db = Database()
@@ -296,10 +302,12 @@ class Gadget(QWidget):
         close.setFixedWidth(30)
         close.setToolTip("Hide to tray")
         close.clicked.connect(self.hide)
+        top.addWidget(self._panel_toggle("sidebar"))
         top.addWidget(self.dot)
         top.addWidget(self.status_lbl)
         top.addStretch()
         top.addWidget(self.power_btn)
+        top.addWidget(self._panel_toggle("inspector"))
         top.addWidget(close)
         lay.addLayout(top)
 
@@ -312,12 +320,42 @@ class Gadget(QWidget):
         self.zones = WorkspaceSplitter(sidebar, self.canvas, inspector)
         self.zones.apply_theme(DARK_TOKENS)
         lay.addWidget(self.zones, 1)
+        self.layout_controller = LayoutController(self.zones, focus_target=self.input, parent=self)
+        self.layout_controller.layout_changed.connect(self._sync_panel_toggles)
         self._show_view("chat")
 
         self.db_footer = QLabel()
         self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
         lay.addWidget(self.db_footer)
         self._update_controls()
+
+    def _panel_toggle(self, zone):
+        """One button and one shortcut per side panel, both routed through _toggle_panel."""
+        glyph, key, name = PANEL_TOGGLES[zone]
+        button = QPushButton(glyph)
+        button.setCheckable(True)
+        button.setChecked(True)
+        button.setFixedWidth(30)
+        button.setToolTip(f"Show / hide the {name} ({key})")
+        button.clicked.connect(lambda: self._toggle_panel(zone))
+        shortcut = QShortcut(QKeySequence(key), self)
+        shortcut.activated.connect(lambda: self._toggle_panel(zone))
+        self.panel_buttons[zone], self.panel_shortcuts[zone] = button, shortcut
+        return button
+
+    def _toggle_panel(self, zone):
+        self.layout_controller.toggle_panel(zone)
+        self._sync_panel_toggles()
+
+    def _sync_panel_toggles(self):
+        for zone, button in self.panel_buttons.items():
+            button.setChecked(not self.layout_controller.is_panel_collapsed(zone))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self.layout_controller is not None:
+            self.layout_controller.evaluate_viewport(e.size().width())
+            self._sync_panel_toggles()
 
     def _sidebar(self):
         """Navigation & session zone: canvas views plus this user's sessions."""

@@ -41,7 +41,7 @@ Three threads cooperate: the Qt UI thread (`Gadget` in `app.py`), one `ChatWorke
 
 **Supporting modules.** `files.py` parses attachments (incl. `.docx` via zip+XML, `.pdf` via `pdftotext`/`pypdf`) and does the git-aware folder-context scan; `images.py` downscales vision attachments to ≤1568px, flattens alpha onto white, and embeds as JPEG data URLs; `chat_ui.py`/`tool_ui.py` hold dialogs and per-message widgets.
 
-**Workspace layout.** `Gadget` is a three-zone `WorkspaceSplitter` (`layout/`): navigation/session sidebar, a stacked primary canvas (Chat / Settings), and an inspector (profile, endpoint, GPUs, tool options). Side panels have min/max `PanelBounds`; spare width goes to the canvas. Zone styling goes through `theme/` (`ThemeTokens` → `ThemeAdapter`); `python -m llama_gadget.theme.lint` rejects raw hex/rgb/px literals in `layout/` and the adapter.
+**Workspace layout.** `Gadget` is a three-zone `WorkspaceSplitter` (`layout/`): navigation/session sidebar, a stacked primary canvas (Chat / Settings), and an inspector (profile, endpoint, GPUs, tool options). Side panels have min/max `PanelBounds`; spare width goes to the canvas. Zone styling goes through `theme/` (`ThemeTokens` → `ThemeAdapter`); `python -m llama_gadget.theme.lint` rejects raw hex/rgb/px literals in `layout/` and the adapter. `LayoutController` collapses side panels by hiding them (☰ / ⓘ buttons, `Ctrl+B` / `Ctrl+Alt+B`) and, from `Gadget.resizeEvent`, auto-collapses both below 900px, restoring on widen only the panels compact mode hid; collapsing a focused panel moves focus to the chat input.
 
 ## Design docs
 
