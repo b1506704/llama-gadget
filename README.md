@@ -36,6 +36,11 @@ Switch profiles instantly via the header dropdown:
   - Tool inspector: browse available built-in and MCP tools, schemas, and provider statuses.
   - YOLO mode: optional checkbox to auto-approve all tool calls (file writes, bash, MCP) without prompting.
 - **Gadget mode**: Frameless, translucent background, stays-on-top, draggable. Closing window minimizes to the system tray.
+- **Keyboard-first navigation** (`Ctrl` on Linux/Windows, `Cmd` on macOS):
+  - `Ctrl+K` command palette: fuzzy-search every action, model profile and view; recently used commands first; `↑`/`↓` wrap, `Enter` runs, `Esc` closes and returns focus.
+  - `Ctrl+/` (or `?` outside text fields) opens a read-only shortcut cheat sheet grouped by category.
+  - Highlights: `Ctrl+M` / `Ctrl+Shift+M` next/previous model, `Ctrl+N` new chat, `Ctrl+I` focus prompt, `Ctrl+B` sidebar, `Ctrl+,` settings, `Ctrl+Shift+T` tool panel (`Ctrl+Return` / `Ctrl+Shift+K` connect / disconnect MCP inside it), `Ctrl+Shift+P` parameter controls, `Ctrl+Shift+D` dark/light theme.
+  - `Tab` / `Shift+Tab` follow the visual layout (the prompt box no longer swallows `Tab`), focus stays inside open dialogs, and list arrows wrap.
 
 ## Run
 ```bash

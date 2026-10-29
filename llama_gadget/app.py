@@ -24,7 +24,8 @@ from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
-from .shortcuts import ActionRegistry, ShortcutPriorityFilter, register_primary_actions
+from .shortcuts import (ActionRegistry, ShortcutCheatSheetDialog, ShortcutPriorityFilter, install_list_wrap,
+                        register_primary_actions, set_tab_chain)
 from .command_palette import CommandPaletteDialog, MRUHistoryTracker, PaletteItem
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
@@ -143,6 +144,7 @@ class FolderDialog(QDialog):
             item.setCheckState(Qt.CheckState.Checked if fits else Qt.CheckState.Unchecked)
             self.list.addItem(item)
         self.list.itemChanged.connect(self._update)
+        install_list_wrap(self.list)
         lay.addWidget(self.list, 1)
         self.total_seen = total_seen
         row = QHBoxLayout()
@@ -235,10 +237,12 @@ class Gadget(QWidget):
         self.actions = register_primary_actions(ActionRegistry(), self)
         self._shortcuts = (self.actions.bind_shortcuts(self)
                            + self.actions.bind_shortcuts(self.chat_page, scope='chat'))
-        self._shortcut_filter = ShortcutPriorityFilter(self.actions, self)
+        self._shortcut_filter = ShortcutPriorityFilter(self.actions, self, self.show_shortcut_cheat_sheet)
         QApplication.instance().installEventFilter(self._shortcut_filter)
         self.palette_mru = MRUHistoryTracker()
         self._palette = None
+        self._cheat_sheet = None
+        self._transcript_focus = None
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -266,6 +270,7 @@ class Gadget(QWidget):
 
         self._poll()
         self._render()
+        self._apply_focus_order()
         self._refresh_history()
         self._refresh_db_status()
         self.gadget_cb.setChecked(self.settings.value("gadget", False, bool))
@@ -386,6 +391,7 @@ class Gadget(QWidget):
         self.input = InputBox()
         self.input.setPlaceholderText("Message… (Enter send · Ctrl+Shift+V clips)")
         self.input.setFixedHeight(64)
+        self.input.setTabChangesFocus(True)
         self.input.submit.connect(self.send)
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
@@ -445,6 +451,9 @@ class Gadget(QWidget):
         row.addWidget(self.send_btn)
         row.addWidget(self.stop_btn)
         lay.addLayout(row)
+        self._chat_chain = [self.scroll_bottom_btn, self.attach_clear, self.input, self.tools_cb,
+                            self.workspace_btn, self.tools_btn, self.show_tools_cb, self.yolo_cb, self.refresh_btn,
+                            self.attach_btn, self.folder_btn, self.clip_btn, self.send_btn, self.stop_btn]
         self._update_controls()
         self._update_stats()
         return w
@@ -456,14 +465,17 @@ class Gadget(QWidget):
         self.hist_user_lbl = QLabel()
         lay.addWidget(self.hist_user_lbl)
         self.hist_list = QListWidget()
-        self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
+        self.hist_list.itemActivated.connect(lambda _: self._open_selected())  # double-click or Enter
+        install_list_wrap(self.hist_list)
         lay.addWidget(self.hist_list, 1)
         row = QHBoxLayout()
+        self._history_chain = [self.hist_list]
         for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
                          ("Refresh", self._refresh_history)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             row.addWidget(b)
+            self._history_chain.append(b)
         lay.addLayout(row)
         return w
 
@@ -484,6 +496,7 @@ class Gadget(QWidget):
 
         lay.addWidget(QLabel("<b>System prompt</b> (saved per user and profile)"))
         self.prompt_edit = QTextEdit()
+        self.prompt_edit.setTabChangesFocus(True)
         self.prompt_edit.setPlainText(self.system_prompt)
         lay.addWidget(self.prompt_edit, 1)
         prow = QHBoxLayout()
@@ -537,6 +550,8 @@ class Gadget(QWidget):
         mcp_row.addWidget(mcp_btn)
         mcp_row.addStretch()
         lay.addLayout(mcp_row)
+        self._settings_chain = [self.user_edit, apply_u, self.prompt_edit, save_p, reset_p, self.endpoint_edit,
+                                apply_ep, reset_ep, browse, default, clear_clips, mcp_btn]
 
         return w
 
@@ -585,6 +600,28 @@ class Gadget(QWidget):
         self.setStyleSheet(theme.stylesheet(tokens))
         self.view.setStyleSheet(theme.transcript_stylesheet(tokens))
 
+    def _apply_focus_order(self):
+        """Tab / Shift+Tab follow the visual layout: header, sidebar, tabs, then the page top to bottom."""
+        cards = self._transcript_cards()
+        transcript = [w for card in cards for w in (card.copy_btn, card.body)]
+        self._transcript_focus = tuple(map(id, cards))
+        set_tab_chain([self.power_btn, self.close_btn, self.profile_cb, self.edit_ep_btn, self.gadget_cb,
+                       self.tabs.tabBar(), *transcript, *self._chat_chain, *self._history_chain,
+                       *self._settings_chain])
+
+    def _transcript_cards(self):
+        return [self.view.column.itemAt(i).widget() for i in range(self.view.column.count() - 1)]
+
+    def show_shortcut_cheat_sheet(self):
+        if self._cheat_sheet is not None:
+            return
+        self._cheat_sheet = ShortcutCheatSheetDialog(self.actions, self.theme.tokens, self)
+        try:
+            self._cheat_sheet.exec_and_restore_focus()
+        finally:
+            self._cheat_sheet.deleteLater()
+            self._cheat_sheet = None
+
     def palette_items(self):
         items = [PaletteItem(spec.id, spec.title, spec.category, self.actions.hint(spec.id),
                              lambda i=spec.id: self.actions.dispatch(i))
@@ -621,13 +658,11 @@ class Gadget(QWidget):
         focused = QApplication.focusWidget()
         if focused is not None and page.isAncestorOf(focused):
             return
-        w = page.nextInFocusChain()
-        while w is not page and w is not self:  # first focusable control on the page
-            if page.isAncestorOf(w) and w.isVisibleTo(page) and w.isEnabled() \
-                    and w.focusPolicy() & Qt.FocusPolicy.TabFocus:
+        chain = (self._chat_chain, self._history_chain, self._settings_chain)[index]
+        for w in chain:  # first focusable control on the page, in Tab order
+            if w.isVisibleTo(page) and w.isEnabled():
                 w.setFocus(Qt.FocusReason.ShortcutFocusReason)
                 return
-            w = w.nextInFocusChain()
 
     def focus_prompt(self):
         self.show_tab(0)
@@ -936,6 +971,8 @@ class Gadget(QWidget):
         self.view.set_messages(self.msgs, live_reply=self.reply if self.worker else '',
                                activity=(self.tool_status or '…') if self.worker else '',
                                error=self.last_error, show_tools=self.show_tools_cb.isChecked())
+        if self._transcript_focus is not None and self._transcript_focus != tuple(map(id, self._transcript_cards())):
+            self._apply_focus_order()  # new message cards join the Tab chain in transcript order
 
         if stick:
             bar.setValue(bar.maximum())

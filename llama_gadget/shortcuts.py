@@ -10,8 +10,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from PyQt6.QtCore import QEvent, QObject, Qt
-from PyQt6.QtGui import QKeySequence, QShortcut
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QColor, QKeySequence, QShortcut
+from PyQt6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox, QDialog,
+                             QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                             QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+
+from .theme import stylesheet
 
 GLOBAL = Qt.ShortcutContext.ApplicationShortcut
 CONTEXTUAL = Qt.ShortcutContext.WidgetWithChildrenShortcut
@@ -168,23 +172,144 @@ def restore_focus_on_close(dialog, target=None):
     return target
 
 
-class ShortcutPriorityFilter(QObject):
-    """Application event filter that lets global chords (e.g. Cmd+K) win over text-widget key bindings."""
+def is_text_input(widget):
+    if isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+        return not (isinstance(widget, (QTextEdit, QPlainTextEdit)) and widget.isReadOnly())
+    return isinstance(widget, QComboBox) and widget.isEditable()
 
-    def __init__(self, registry, window):
+
+class ShortcutPriorityFilter(QObject):
+    """Application event filter for ``window``: global chords (e.g. Cmd+K) win over text-widget key
+    bindings, and a bare '?' calls ``question_handler`` unless a text input has focus."""
+
+    def __init__(self, registry, window, question_handler=None):
         super().__init__(window)
         self.window = window
         self.sequences = registry.global_sequences()
+        self.question_handler = question_handler
+
+    def _owns_focus(self):
+        if QApplication.activeModalWidget() is not None:
+            return None
+        focused = QApplication.focusWidget()
+        return focused if focused is not None and focused.window() is self.window else None
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.ShortcutOverride and QApplication.activeModalWidget() is None:
-            focused = QApplication.focusWidget()
-            if focused is not None and focused.window() is self.window:
-                seq = QKeySequence(event.keyCombination()).toString(QKeySequence.SequenceFormat.PortableText)
-                if seq in self.sequences:
-                    event.ignore()  # not overridden: the shortcut map handles it
-                    return True
+        kind = event.type()
+        if kind == QEvent.Type.ShortcutOverride and (focused := self._owns_focus()) is not None:
+            seq = QKeySequence(event.keyCombination()).toString(QKeySequence.SequenceFormat.PortableText)
+            if seq in self.sequences:
+                event.ignore()  # not overridden: the shortcut map handles it
+                return True
+        elif (kind == QEvent.Type.KeyPress and self.question_handler is not None and event.text() == '?'
+              and not event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
+                                           | Qt.KeyboardModifier.MetaModifier)):
+            focused = self._owns_focus()
+            if focused is not None and not is_text_input(focused):
+                self.question_handler()
+                return True
         return False
+
+
+def set_tab_chain(widgets):
+    """Explicit Tab / Shift+Tab order through ``widgets`` (None entries are skipped)."""
+    widgets = [w for w in widgets if w is not None]
+    for first, second in zip(widgets, widgets[1:]):
+        QWidget.setTabOrder(first, second)
+
+
+class ListWrapFilter(QObject):
+    """Up on the first row selects the last one and Down on the last row selects the first."""
+
+    def eventFilter(self, view, event):
+        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down) \
+                and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
+            model, rows = view.model(), view.model().rowCount(view.rootIndex()) if view.model() else 0
+            row = view.currentIndex().row()
+            if rows and ((event.key() == Qt.Key.Key_Down and row == rows - 1) or
+                         (event.key() == Qt.Key.Key_Up and row == 0)):
+                view.setCurrentIndex(model.index(0 if row == rows - 1 else rows - 1, 0, view.rootIndex()))
+                return True
+        return False
+
+
+def install_list_wrap(view):
+    view._wrap_filter = ListWrapFilter(view)
+    view.installEventFilter(view._wrap_filter)
+    return view
+
+
+class ShortcutCheatSheetDialog(QDialog):
+    """Read-only overlay listing every registered action and its shortcut, grouped by category."""
+
+    def __init__(self, registry, tokens, parent=None, platform=None):
+        super().__init__(parent)
+        self.setWindowTitle('Keyboard shortcuts')
+        self.setModal(True)
+        self.setStyleSheet(stylesheet(tokens) + f"""
+            QTreeWidget#shortcuts {{ font-size: 12px; }}
+            QLabel#title {{ color: {tokens.text_strong}; font-size: 14px; font-weight: bold; }}""")
+        self.resize(520, 560)
+        layout = QVBoxLayout(self)
+        title = QLabel('Keyboard shortcuts', objectName='title')
+        layout.addWidget(title)
+        self.tree = QTreeWidget(objectName='shortcuts')
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(['Action', 'Shortcut'])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setAccessibleName('Keyboard shortcuts by category')
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        badge_bg, badge_fg = QColor(tokens.badge), QColor(tokens.badge_text)
+        for category, specs in registry.list_by_category().items():
+            group = QTreeWidgetItem([category])
+            font = group.font(0)
+            font.setBold(True)
+            group.setFont(0, font)
+            group.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.tree.addTopLevelItem(group)
+            group.setFirstColumnSpanned(True)
+            for spec in specs:
+                row = QTreeWidgetItem([spec.title, registry.hint(spec.id, platform) or '—'])
+                row.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                row.setToolTip(0, spec.description or spec.title)
+                row.setBackground(1, badge_bg)
+                row.setForeground(1, badge_fg)
+                group.addChild(row)
+            group.setExpanded(True)
+        layout.addWidget(self.tree, 1)
+        row = QHBoxLayout()
+        hint = QLabel('Esc to close')
+        hint.setProperty('muted', True)
+        row.addWidget(hint)
+        row.addStretch()
+        self.close_btn = QPushButton('Close')
+        self.close_btn.clicked.connect(self.reject)
+        row.addWidget(self.close_btn)
+        layout.addLayout(row)
+        set_tab_chain([self.tree, self.close_btn])
+        first = self.tree.topLevelItem(0)
+        if first is not None and first.childCount():
+            self.tree.setCurrentItem(first.child(0))
+
+    def groups(self):
+        """{category: [(title, hint), ...]} as displayed."""
+        out = {}
+        for i in range(self.tree.topLevelItemCount()):
+            group = self.tree.topLevelItem(i)
+            out[group.text(0)] = [(group.child(j).text(0), group.child(j).text(1)) for j in range(group.childCount())]
+        return out
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.tree.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def exec_and_restore_focus(self):
+        restore_focus_on_close(self, QApplication.focusWidget())
+        return self.exec()
 
 
 # Primary workflows from the brief; coverage is measured against this list.
@@ -201,6 +326,8 @@ def register_primary_actions(registry, gadget, theme_controller=None):
     theme = theme_controller if theme_controller is not None else gadget.theme
     g = gadget
     specs = [
+        CommandSpec('help.shortcuts', 'Keyboard shortcuts', 'General', 'Cmd+/', hint_extra='?',
+                    handler=lambda: g.show_shortcut_cheat_sheet(), description='Show this cheat sheet'),
         CommandSpec('app.command_palette', 'Command palette', 'General', 'Cmd+K',
                     handler=lambda: g.open_command_palette(), description='Search and run any command'),
         # Models

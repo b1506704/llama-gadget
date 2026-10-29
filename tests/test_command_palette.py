@@ -2,14 +2,14 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit, QVBoxLayout, QWidget
 
 from llama_gadget import theme
 from llama_gadget.command_palette import (CommandPaletteDialog, FuzzyMatcher, MRUHistoryTracker, PaletteItem,
                                           fuzzy_score)
-from tests.test_shortcuts import GadgetCase, pump, show_and_focus
+from tests.test_shortcuts import GadgetCase, pump, show_and_focus, when_modal
 
 APPLICATION = QApplication.instance() or QApplication([])
 
@@ -23,17 +23,6 @@ SAMPLE = items(('chat.new', 'New chat session', 'Chat', 'Ctrl+N'),
                ('settings.open', 'Open settings', 'Navigation', 'Ctrl+,'),
                ('model:vision', 'Switch model: Image analysis', 'Models', ''),
                ('tools.panel', 'Toggle tool panel', 'Tools', 'Ctrl+Shift+T'))
-
-
-def when_modal(callback):
-    """Run ``callback(dialog)`` once a modal dialog is showing (exec() blocks the test otherwise)."""
-    def poll():
-        dialog = QApplication.activeModalWidget()
-        if dialog is None or not dialog.isActiveWindow():
-            QTimer.singleShot(10, poll)
-        else:
-            callback(dialog)
-    QTimer.singleShot(0, poll)
 
 
 class MatcherTests(unittest.TestCase):

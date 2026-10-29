@@ -39,6 +39,8 @@ Three threads cooperate: the Qt UI thread (`Gadget` in `app.py`), one `ChatWorke
 
 **Persistence** (`db.py`): SQLite at repo root (`llama_gadget.db`, gitignored). Tables: `users` (system prompt keyed by hostname), `sessions`, `messages` (with `attachments` and `metadata` JSON), `clips` (50-entry clipboard ring buffer).
 
+**Keyboard layer.** `shortcuts.py` holds the single `ActionRegistry` (`CommandSpec` = id/title/category/chords/context/scope/handler); `register_primary_actions` wires it to `Gadget` methods and every other surface (QShortcuts, `command_palette.py`, the cheat sheet) derives from it — add new commands there, not as ad-hoc `keyPressEvent`s. Chords are written with `Cmd`, which always resolves to Qt `CTRL` (Qt maps that to ⌘ on macOS). `ShortcutPriorityFilter` (app-wide event filter) lets global chords beat text-widget bindings and handles the bare `?` trigger. `theme.py` holds dark/light `ThemeTokens`, the app stylesheet built from them, and `ThemeController` (persisted in QSettings).
+
 **Supporting modules.** `files.py` parses attachments (incl. `.docx` via zip+XML, `.pdf` via `pdftotext`/`pypdf`) and does the git-aware folder-context scan; `images.py` downscales vision attachments to ≤1568px, flattens alpha onto white, and embeds as JPEG data URLs; `chat_ui.py`/`tool_ui.py` hold dialogs and per-message widgets.
 
 ## Design docs

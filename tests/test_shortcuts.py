@@ -1,18 +1,19 @@
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings, Qt, QTimer
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QLineEdit, QWidget
+from PyQt6.QtWidgets import QApplication, QLineEdit, QListWidget, QVBoxLayout, QWidget
 
-from llama_gadget import shortcuts, theme
+from llama_gadget import profiles, shortcuts, theme
 from llama_gadget.app import Gadget
 from llama_gadget.shortcuts import (CONTEXTUAL, GLOBAL, PRIMARY_ACTIONS, ActionRegistry, CommandSpec,
-                                    coverage, format_shortcut_hint, register_primary_actions,
+                                    ShortcutCheatSheetDialog, coverage, install_list_wrap, format_shortcut_hint, register_primary_actions,
                                     resolve_key_sequence)
 
 APPLICATION = QApplication.instance() or QApplication([])
@@ -32,6 +33,17 @@ def show_and_focus(window, widget=None):
     if widget is not None:
         widget.setFocus()
     pump()
+
+
+def when_modal(callback):
+    """Run ``callback(dialog)`` once a modal dialog is showing (exec() blocks the test otherwise)."""
+    def poll():
+        dialog = QApplication.activeModalWidget()
+        if dialog is None or not dialog.isActiveWindow():
+            QTimer.singleShot(10, poll)
+        else:
+            callback(dialog)
+    QTimer.singleShot(0, poll)
 
 
 class GadgetCase(unittest.TestCase):
@@ -261,6 +273,153 @@ class ThemeTests(unittest.TestCase):
                            (t.text_muted, t.surface), (t.badge_text, t.badge), (t.selection_text, t.selection),
                            (t.text_strong, t.raised)):
                 self.assertGreaterEqual(theme.contrast_ratio(fg, bg), 4.5, (t.name, fg, bg))
+
+
+class CheatSheetTests(GadgetCase):
+    def registry(self):
+        reg = ActionRegistry()
+        reg.register(CommandSpec('a', 'Alpha one', 'First', 'Cmd+1', handler=MagicMock()))
+        reg.register(CommandSpec('b', 'Beta', 'Second', 'Cmd+Shift+B', hint_extra='?'))
+        reg.register(CommandSpec('c', 'Alpha two', 'First'))
+        return reg
+
+    def test_groups_match_registry(self):
+        dlg = ShortcutCheatSheetDialog(self.registry(), theme.DARK, platform='darwin')
+        self.addCleanup(dlg.deleteLater)
+        self.assertEqual(dlg.groups(), {'First': [('Alpha one', 'Cmd+1'), ('Alpha two', '—')],
+                                        'Second': [('Beta', 'Cmd+Shift+B / ?')]})
+        linux = ShortcutCheatSheetDialog(self.registry(), theme.LIGHT, platform='linux')
+        self.addCleanup(linux.deleteLater)
+        self.assertEqual(linux.groups()['Second'], [('Beta', 'Ctrl+Shift+B / ?')])
+
+    def test_gadget_cheat_sheet_lists_every_action(self):
+        app = self.make_gadget()
+        dlg = ShortcutCheatSheetDialog(app.actions, app.theme.tokens, app)
+        self.addCleanup(dlg.deleteLater)
+        groups = dlg.groups()
+        self.assertEqual(list(groups), app.actions.categories())
+        self.assertEqual(sum(map(len, groups.values())), len(app.actions))
+        self.assertIn(('Keyboard shortcuts', 'Ctrl+/ / ?' if sys.platform != 'darwin' else 'Cmd+/ / ?'),
+                      groups['General'])
+
+    def test_focus_is_trapped_and_esc_restores_focus(self):
+        host = QWidget()
+        self.addCleanup(host.deleteLater)
+        QVBoxLayout(host).addWidget(before := QLineEdit())
+        show_and_focus(host, before)
+        dlg = ShortcutCheatSheetDialog(self.registry(), theme.DARK, host)
+        self.addCleanup(dlg.deleteLater)
+        seen = []
+
+        def drive(d):
+            seen.append(QApplication.focusWidget())
+            for _ in range(4):
+                QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Tab)
+                seen.append(QApplication.focusWidget())
+            QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Backtab, Qt.KeyboardModifier.ShiftModifier)
+            seen.append(QApplication.focusWidget())
+            QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Escape)
+        when_modal(drive)
+        dlg.exec_and_restore_focus()
+        self.assertEqual(seen, [dlg.tree, dlg.close_btn, dlg.tree, dlg.close_btn, dlg.tree, dlg.close_btn])
+        pump()
+        self.assertIs(QApplication.focusWidget(), before)
+
+    def test_ctrl_slash_and_question_mark_triggers(self):
+        app = self.make_gadget()
+        show_and_focus(app, app.input)
+        opened = []
+
+        def close(d):
+            opened.append((type(d).__name__, d))
+            QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Escape)
+
+        # Ctrl+/ works even from the prompt text input.
+        when_modal(close)
+        QTest.keyClick(app.input, Qt.Key.Key_Slash, Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual([name for name, _ in opened], ['ShortcutCheatSheetDialog'])
+        pump()
+        self.assertIs(QApplication.focusWidget(), app.input)
+
+        # '?' inside a text input is just a character.
+        QTest.keyClick(app.input, Qt.Key.Key_Question, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(app.input.toPlainText(), '?')
+        app.show_tab(2)
+        app.user_edit.setFocus()
+        pump()
+        QTest.keyClicks(app.user_edit, '?')
+        self.assertTrue(app.user_edit.text().endswith('?'))
+        self.assertEqual(len(opened), 1)
+
+        # '?' on a non-text control opens the cheat sheet and focus returns there.
+        app.show_tab(1)
+        app.hist_list.setFocus()
+        pump()
+        when_modal(close)
+        QTest.keyClick(app.hist_list, Qt.Key.Key_Question, Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(len(opened), 2)
+        pump()
+        self.assertIs(QApplication.focusWidget(), app.hist_list)
+
+
+class FocusNavigationTests(GadgetCase):
+    def test_tab_order_follows_visual_layout(self):
+        app = self.make_gadget()
+        app.workspace = '/tmp'
+        app.profile_cb.blockSignals(True)
+        app.profile_cb.setCurrentIndex(app.profile_cb.findData('agent-gpu0'))
+        app.profile_cb.blockSignals(False)
+        app.profile = profiles.PROFILES['agent-gpu0']
+        app._update_controls()
+        show_and_focus(app, app.power_btn)
+        expected = [w for w in [app.power_btn, app.close_btn, app.profile_cb, app.edit_ep_btn, app.gadget_cb,
+                                app.tabs.tabBar()] + [w for c in app._transcript_cards() for w in (c.copy_btn, c.body)]
+                    + app._chat_chain
+                    if w.isVisible() and w.isEnabled() and w.focusPolicy() & Qt.FocusPolicy.TabFocus]
+        self.assertIn(app.input, expected)
+        self.assertIn(app.tools_cb, expected)
+        seen = [QApplication.focusWidget()]
+        for _ in range(len(expected) - 1):
+            QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Tab)
+            seen.append(QApplication.focusWidget())
+        self.assertEqual(seen, expected)
+        # Shift+Tab walks the same chain backwards.
+        QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Backtab, Qt.KeyboardModifier.ShiftModifier)
+        self.assertIs(QApplication.focusWidget(), expected[-2])
+
+    def test_settings_tab_order(self):
+        app = self.make_gadget()
+        show_and_focus(app)
+        app.show_tab(2)
+        pump()
+        self.assertIs(QApplication.focusWidget(), app.user_edit)
+        seen = [app.user_edit]
+        for _ in range(len(app._settings_chain) - 1):
+            QTest.keyClick(QApplication.focusWidget(), Qt.Key.Key_Tab)
+            seen.append(QApplication.focusWidget())
+        self.assertEqual(seen, app._settings_chain)
+
+    def test_list_navigation_wraps(self):
+        lst = QListWidget()
+        self.addCleanup(lst.deleteLater)
+        lst.addItems(['one', 'two', 'three'])
+        install_list_wrap(lst)
+        lst.setCurrentRow(2)
+        QTest.keyClick(lst, Qt.Key.Key_Down)
+        self.assertEqual(lst.currentRow(), 0)
+        QTest.keyClick(lst, Qt.Key.Key_Up)
+        self.assertEqual(lst.currentRow(), 2)
+        QTest.keyClick(lst, Qt.Key.Key_Up)
+        self.assertEqual(lst.currentRow(), 1)
+
+    def test_history_list_wraps(self):
+        app = self.make_gadget()
+        for title in ('a', 'b'):
+            app.db.create_session(app.user, title)
+        app._refresh_history()
+        app.hist_list.setCurrentRow(app.hist_list.count() - 1)
+        QTest.keyClick(app.hist_list, Qt.Key.Key_Down)
+        self.assertEqual(app.hist_list.currentRow(), 0)
 
 
 if __name__ == '__main__':
