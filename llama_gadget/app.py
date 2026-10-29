@@ -24,7 +24,8 @@ from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
-from .shortcuts import ActionRegistry, register_primary_actions
+from .shortcuts import ActionRegistry, ShortcutPriorityFilter, register_primary_actions
+from .command_palette import CommandPaletteDialog, MRUHistoryTracker, PaletteItem
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
@@ -234,6 +235,10 @@ class Gadget(QWidget):
         self.actions = register_primary_actions(ActionRegistry(), self)
         self._shortcuts = (self.actions.bind_shortcuts(self)
                            + self.actions.bind_shortcuts(self.chat_page, scope='chat'))
+        self._shortcut_filter = ShortcutPriorityFilter(self.actions, self)
+        QApplication.instance().installEventFilter(self._shortcut_filter)
+        self.palette_mru = MRUHistoryTracker()
+        self._palette = None
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -579,6 +584,26 @@ class Gadget(QWidget):
     def _apply_theme(self, tokens):
         self.setStyleSheet(theme.stylesheet(tokens))
         self.view.setStyleSheet(theme.transcript_stylesheet(tokens))
+
+    def palette_items(self):
+        items = [PaletteItem(spec.id, spec.title, spec.category, self.actions.hint(spec.id),
+                             lambda i=spec.id: self.actions.dispatch(i))
+                 for spec in self.actions if spec.id != 'app.command_palette' and spec.handler is not None]
+        items += [PaletteItem(f'model:{p.key}', f'Switch model: {p.label}', 'Models',
+                              'current' if p.key == self.profile.key else '',
+                              lambda k=p.key: self.select_model(k))
+                  for p in profiles.PROFILES.values()]
+        return items
+
+    def open_command_palette(self):
+        if self._palette is not None:
+            return None
+        self._palette = CommandPaletteDialog(self.palette_items(), self.theme.tokens, self.palette_mru, self)
+        try:
+            return self._palette.exec_and_restore_focus(self)
+        finally:
+            self._palette.deleteLater()
+            self._palette = None
 
     def cycle_model(self, step):
         n = self.profile_cb.count()

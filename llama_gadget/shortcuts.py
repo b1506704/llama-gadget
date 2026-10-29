@@ -9,8 +9,9 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, QObject, Qt
 from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtWidgets import QApplication
 
 GLOBAL = Qt.ShortcutContext.ApplicationShortcut
 CONTEXTUAL = Qt.ShortcutContext.WidgetWithChildrenShortcut
@@ -152,12 +153,46 @@ class ActionRegistry:
         return shortcuts
 
 
+def restore_focus_on_close(dialog, target=None):
+    """Return focus to ``target`` (default: the current focus widget) when ``dialog`` finishes."""
+    target = target if target is not None else QApplication.focusWidget()
+
+    def restore(*_):
+        try:
+            if target is not None and target.isVisible():
+                target.activateWindow()
+                target.setFocus(Qt.FocusReason.PopupFocusReason)
+        except RuntimeError:  # the invoking control was deleted meanwhile
+            pass
+    dialog.finished.connect(restore)
+    return target
+
+
+class ShortcutPriorityFilter(QObject):
+    """Application event filter that lets global chords (e.g. Cmd+K) win over text-widget key bindings."""
+
+    def __init__(self, registry, window):
+        super().__init__(window)
+        self.window = window
+        self.sequences = registry.global_sequences()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ShortcutOverride and QApplication.activeModalWidget() is None:
+            focused = QApplication.focusWidget()
+            if focused is not None and focused.window() is self.window:
+                seq = QKeySequence(event.keyCombination()).toString(QKeySequence.SequenceFormat.PortableText)
+                if seq in self.sequences:
+                    event.ignore()  # not overridden: the shortcut map handles it
+                    return True
+        return False
+
+
 # Primary workflows from the brief; coverage is measured against this list.
 PRIMARY_ACTIONS = (
     'model.next', 'model.prev', 'chat.new_session', 'chat.clear_session', 'chat.focus_prompt',
     'chat.copy_last_response', 'chat.stop', 'tools.toggle_panel', 'tools.toggle_enabled',
     'tools.run_active', 'tools.clear_session', 'panels.toggle_sidebar', 'settings.open',
-    'params.focus', 'params.toggle_tool_details', 'theme.toggle', 'service.toggle',
+    'params.focus', 'params.toggle_tool_details', 'theme.toggle', 'service.toggle', 'app.command_palette',
 )
 
 
@@ -166,6 +201,8 @@ def register_primary_actions(registry, gadget, theme_controller=None):
     theme = theme_controller if theme_controller is not None else gadget.theme
     g = gadget
     specs = [
+        CommandSpec('app.command_palette', 'Command palette', 'General', 'Cmd+K',
+                    handler=lambda: g.open_command_palette(), description='Search and run any command'),
         # Models
         CommandSpec('model.next', 'Next model', 'Models', 'Cmd+M', handler=lambda: g.cycle_model(1),
                     description='Switch to the next model profile'),
