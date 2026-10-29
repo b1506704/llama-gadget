@@ -27,9 +27,11 @@ from .db import DEFAULT_DB, Database
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
+from .theme import (JsonThemePreferenceStore, ThemeManager, ThemePersistError, ThemePreference,
+                    active_adapter, bind_theme, default_preferences_path)
 
 DEFAULT_USER = socket.gethostname()  # PC name
-COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
+STATUS_TONES = {"online": "success", "loading": "warning", "offline": "error"}  # service state -> token
 
 
 def clean_endpoint(url: str) -> str:
@@ -38,25 +40,6 @@ def clean_endpoint(url: str) -> str:
         url = "http://" + url
     url = re.sub(r"/v1(/chat/completions)?/?$", "", url)
     return url.rstrip("/")
-
-STYLE = """
-QWidget#root { background: #14161a; border: 1px solid #2a2e35; border-radius: 10px; }
-QLabel, QCheckBox { color: #d0d4da; }
-QTextBrowser, QTextEdit, QLineEdit, QListWidget { background: #1b1e24; color: #e6e8eb;
-    border: 1px solid #2a2e35; border-radius: 6px; padding: 4px; }
-QComboBox { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; border-radius: 6px; padding: 4px 8px; }
-QComboBox QAbstractItemView { background: #1b1e24; color: #e6e8eb; selection-background-color: #2a3140; }
-QListWidget::item { padding: 4px; border-bottom: 1px solid #23272e; }
-QListWidget::item:selected { background: #2a3140; }
-QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
-QPushButton:hover { background: #363b44; }
-QPushButton:disabled { color: #6b7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { background: #1b1e24; color: #9aa0a8; padding: 5px 12px; border-radius: 6px; margin-right: 3px; }
-QTabBar::tab:selected { background: #2a3140; color: #e6e8eb; }
-QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
-QMenu::item:selected { background: #2a3140; }
-"""
 
 
 def make_icon(color: str) -> QIcon:
@@ -141,7 +124,6 @@ class FolderDialog(QDialog):
     def __init__(self, parent, root, files, total_seen, budget):
         super().__init__(parent)
         self.setWindowTitle(f"Folder context — {Path(root).name}")
-        self.setStyleSheet("QDialog{background:#14161a;}" + STYLE)
         self.resize(460, 520)
         self.files, self.budget = files, budget
         lay = QVBoxLayout(self)
@@ -173,6 +155,9 @@ class FolderDialog(QDialog):
         row.addWidget(cancel)
         row.addWidget(ok)
         lay.addLayout(row)
+        bind_theme(self.apply_theme)
+
+    def apply_theme(self, _adapter):
         self._update()
 
     def _set_all(self, st):
@@ -189,7 +174,7 @@ class FolderDialog(QDialog):
         sel = self.selected()
         chars = sum(f["chars"] for f in sel)
         over = chars > self.budget
-        color = "#f85149" if over else "#3fb950"
+        color = active_adapter().status_color("error" if over else "success")
         self.info.setText(
             f"{self.total_seen} files seen · {len(self.files)} text files ranked (docs/config/source first).<br>"
             f'Selected {len(sel)} files · <span style="color:{color}">{chars:,} chars (~{chars // 3:,} tokens)</span>'
@@ -230,6 +215,7 @@ class Gadget(QWidget):
         self.msgs = []
         self.session_id = None
         self.attachments = []
+        self._db_st = None
 
         self.user = self.settings.value("user", DEFAULT_USER) or DEFAULT_USER
         self.db = Database()
@@ -244,8 +230,8 @@ class Gadget(QWidget):
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
         self.resize(420, 660)
+        self.theme = ThemeManager(JsonThemePreferenceStore(default_preferences_path()), parent=self)
         self._build_ui()
-        self.setStyleSheet(STYLE)
 
         self.bridge = Bridge()
         self.bridge.status.connect(self._set_status)
@@ -256,7 +242,7 @@ class Gadget(QWidget):
         self.timer = QTimer(self, interval=3000, timeout=self._poll)
         self.timer.start()
 
-        self.tray = QSystemTrayIcon(make_icon(COLORS["offline"]), self)
+        self.tray = QSystemTrayIcon(self)
         menu = QMenu()
         menu.addAction("Show / Hide", self.toggle_visible)
         self.tray_toggle = QAction("Start service", menu, triggered=self.toggle_service)
@@ -265,6 +251,8 @@ class Gadget(QWidget):
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
             lambda r: self.toggle_visible() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.theme.theme_changed.connect(self._apply_theme)
+        self.theme.apply()
         self.tray.show()
         QApplication.instance().aboutToQuit.connect(self._shutdown_workers)
 
@@ -282,6 +270,7 @@ class Gadget(QWidget):
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        self.page_gap = self.theme.tokens().spacing.xxs
         root = QWidget(objectName="root")
         outer.addWidget(root)
         lay = QVBoxLayout(root)
@@ -315,7 +304,6 @@ class Gadget(QWidget):
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
         self.edit_ep_btn = QPushButton("✎")
         self.edit_ep_btn.setFixedSize(26, 26)
@@ -337,14 +325,13 @@ class Gadget(QWidget):
         lay.addWidget(self.tabs, 1)
 
         self.db_footer = QLabel()
-        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
         lay.addWidget(self.db_footer)
         self._update_controls()
 
     def _chat_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setContentsMargins(0, self.page_gap, 0, 0)
 
         self.view = ChatTranscript()
         self.view.image_requested.connect(self._preview_image)
@@ -356,11 +343,7 @@ class Gadget(QWidget):
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
-        self.stats_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
         self.scroll_bottom_btn = QPushButton("↓ Bottom")
-        self.scroll_bottom_btn.setStyleSheet(
-            "background: #238636; color: #ffffff; font-weight: bold; border-radius: 4px; "
-            "padding: 2px 8px; font-size: 11px;")
         self.scroll_bottom_btn.setToolTip("Jump to latest messages")
         self.scroll_bottom_btn.clicked.connect(self._scroll_to_bottom)
         self.scroll_bottom_btn.hide()
@@ -369,7 +352,6 @@ class Gadget(QWidget):
         lay.addLayout(srow)
 
         self.gpu_lbl = QLabel("GPU: …")
-        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
         lay.addWidget(self.gpu_lbl)
 
         self.attach_lbl = AttachmentStrip()
@@ -451,7 +433,7 @@ class Gadget(QWidget):
     def _history_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setContentsMargins(0, self.page_gap, 0, 0)
         self.hist_user_lbl = QLabel()
         lay.addWidget(self.hist_user_lbl)
         self.hist_list = QListWidget()
@@ -469,7 +451,7 @@ class Gadget(QWidget):
     def _settings_page(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setContentsMargins(0, self.page_gap, 0, 0)
 
         lay.addWidget(QLabel("<b>User name</b> (defaults to this PC's name)"))
         urow = QHBoxLayout()
@@ -491,7 +473,6 @@ class Gadget(QWidget):
         reset_p = QPushButton("Reset to default")
         reset_p.clicked.connect(self._reset_prompt)
         self.prompt_msg = QLabel()
-        self.prompt_msg.setStyleSheet("color:#8b949e; font-size:11px;")
         prow.addWidget(save_p)
         prow.addWidget(reset_p)
         prow.addWidget(self.prompt_msg, 1)
@@ -510,7 +491,6 @@ class Gadget(QWidget):
         erow.addWidget(reset_ep)
         lay.addLayout(erow)
         self.endpoint_msg = QLabel()
-        self.endpoint_msg.setStyleSheet("color:#8b949e; font-size:11px;")
         lay.addWidget(self.endpoint_msg)
 
         lay.addWidget(QLabel("<b>Database</b> (SQLite)"))
@@ -529,6 +509,18 @@ class Gadget(QWidget):
             drow.addWidget(b)
         lay.addLayout(drow)
 
+        lay.addWidget(QLabel("<b>Theme</b>"))
+        trow = QHBoxLayout()
+        self.theme_cb = QComboBox()
+        for pref in ThemePreference:
+            self.theme_cb.addItem(pref.value.capitalize(), pref.value)
+        self.theme_cb.setCurrentIndex(self.theme_cb.findData(self.theme.preference().value))
+        self.theme_cb.activated.connect(self._on_theme_selected)
+        self.theme_msg = QLabel()
+        trow.addWidget(self.theme_cb)
+        trow.addWidget(self.theme_msg, 1)
+        lay.addLayout(trow)
+
         lay.addWidget(QLabel("<b>MCP Tools Configuration</b>"))
         mcp_row = QHBoxLayout()
         mcp_btn = QPushButton("Configure MCP…")
@@ -538,6 +530,13 @@ class Gadget(QWidget):
         lay.addLayout(mcp_row)
 
         return w
+
+    def _on_theme_selected(self, index):
+        try:
+            self.theme.set_preference(self.theme_cb.itemData(index))
+            self.theme_msg.clear()
+        except ThemePersistError as e:
+            self.theme_msg.setText(f"Applied, but not saved: {e}")
 
     def _apply_gadget(self, on):
         self.settings.setValue("gadget", on)
@@ -655,11 +654,28 @@ class Gadget(QWidget):
             f"GPU{g['index']} {g['name']}: {g['util']}% · {g['used']}/{g['total']} MiB · {g['temp']}°C"
             for g in gpus) or "GPU: n/a")
 
+    def _apply_theme(self, _tokens=None):
+        """Re-style token-derived widgets in place after a theme change; state is untouched."""
+        a = self.theme.adapter
+        caption = a.text_style("muted", "caption")
+        for lbl in (self.endpoint_lbl, self.db_footer, self.stats_lbl, self.gpu_lbl,
+                    self.prompt_msg, self.endpoint_msg):
+            lbl.setStyleSheet(caption)
+        # caption first so the accent rule's bold weight wins
+        self.scroll_bottom_btn.setStyleSheet(
+            f"QPushButton {{ {a.font_style('caption')} }}\n" + a.accent_control_style("QPushButton"))
+        self._render_status()
+        self._render_db_status()
+
+    def _render_status(self):
+        tone = STATUS_TONES[self.state]
+        self.dot.setStyleSheet(self.theme.adapter.status_style(tone, "heading"))
+        self.tray.setIcon(make_icon(self.theme.adapter.status_color(tone)))
+
     def _set_status(self, s):
         self.state = s
-        self.dot.setStyleSheet(f"color: {COLORS[s]}; font-size: 16px;")
+        self._render_status()
         self.status_lbl.setText(s)
-        self.tray.setIcon(make_icon(COLORS[s]))
         self.tray.setToolTip(f"Llama service: {s}")
         self.power_btn.setText("Stop" if s != "offline" else "Start")
         self.tray_toggle.setText("Stop service" if s != "offline" else "Start service")
@@ -1020,7 +1036,6 @@ class Gadget(QWidget):
             worker.decide(call_id, True)
             return
         dialog = QDialog(self)
-        dialog.setStyleSheet('QDialog { background: #14161a; }')
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.resize(620, 420)
         layout = QVBoxLayout(dialog)
@@ -1413,18 +1428,25 @@ class Gadget(QWidget):
         self._refresh_db_status()
 
     def _refresh_db_status(self):
-        st = self.db.status()
+        self._db_st = self.db.status()
+        self._render_db_status()
+
+    def _render_db_status(self):
+        st = self._db_st
+        if st is None:
+            return
+        ok_color, bad_color = (self.theme.adapter.status_color(t) for t in ("success", "error"))
         name = Path(st["path"]).name
         if st["ok"]:
             kb = st["size"] / 1024
             size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
-            html = (f'<span style="color:#3fb950">● Connected</span> · integrity {st["integrity"]} · writable<br>'
+            html = (f'<span style="color:{ok_color}">● Connected</span> · integrity {st["integrity"]} · writable<br>'
                     f'{escape(st["path"])}<br>{size} · {st["sessions"]} sessions · '
                     f'{st["messages"]} messages · {st["clips"]} clips')
             self.db_footer.setText(f"DB ● {name} · {st['sessions']} sessions · {st['messages']} msgs")
         else:
             reason = st.get("error") or ("read-only" if not st.get("writable", True) else st.get("integrity"))
-            html = f'<span style="color:#f85149">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
+            html = f'<span style="color:{bad_color}">● Problem: {escape(str(reason))}</span><br>{escape(st["path"])}'
             self.db_footer.setText(f"DB ✕ {name}")
         self.db_status.setText(html)
         self.db_footer.setToolTip(st["path"])

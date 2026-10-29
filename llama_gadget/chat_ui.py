@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLab
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
 
 from .images import decode_attachment_image
+from .theme import active_tokens, bind_theme
 
 
 def code_block(text):
@@ -36,7 +37,7 @@ class MarkdownBody(QTextBrowser):
 
     def fit_height(self):
         self.document().setTextWidth(max(50, self.viewport().width()))
-        height = math.ceil(self.document().size().height()) + 12
+        height = math.ceil(self.document().size().height()) + active_tokens().spacing.sm
         if height != self.height():
             self.setFixedHeight(height)
 
@@ -89,7 +90,6 @@ class ImagePreviewDialog(QDialog):
         super().__init__(parent)
         self.image = decode_attachment_image(attachment)
         self.setWindowTitle(attachment.get('name', 'Image preview'))
-        self.setStyleSheet('QDialog { background: #14161a; } QLabel, QCheckBox { color: #d0d4da; }')
         self.resize(800, 600)
         layout = QVBoxLayout(self)
         label = QLabel(f"{attachment.get('name', 'Image')} · {self.image.width()}×{self.image.height()}")
@@ -127,7 +127,8 @@ class MessageCard(QWidget):
         self.signature = None
         self.source = {}
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 4, 0, 4)
+        gap = active_tokens().spacing.xxs
+        layout.setContentsMargins(0, gap, 0, gap)
         header = QHBoxLayout()
         self.heading = QLabel()
         self.heading.setTextFormat(Qt.TextFormat.PlainText)
@@ -189,13 +190,17 @@ class ChatTranscript(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
-        self.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: #1b1e24; }')
         container = QWidget()
         self.column = QVBoxLayout(container)
-        self.column.setContentsMargins(4, 4, 4, 4)
+        gap = active_tokens().spacing.xxs
+        self.column.setContentsMargins(gap, gap, gap, gap)
         self.column.addStretch()
         self.setWidget(container)
         self.cards = {}
+        bind_theme(self.apply_theme)
+
+    def apply_theme(self, adapter):
+        self.setStyleSheet(f"QScrollArea, QScrollArea > QWidget > QWidget {{ background: {adapter.surface('primary')}; }}")
 
     def set_messages(self, messages, live_reply='', activity='', error='', show_tools=False):
         visible = []
