@@ -17,6 +17,8 @@ class ThemeTokens:
     loading: str = '#d29922'
     streaming: str = '#3fb950'
     error: str = '#f85149'
+    error_surface: str = '#2a1719'
+    success: str = '#3fb950'
     spacing: int = 4
     radius: int = 6
     font_small: int = 11

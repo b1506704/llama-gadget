@@ -16,8 +16,10 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileD
 
 from . import profiles, service
 from .chat import ChatWorker
-from .chat_ui import (ChatTranscript, AttachmentStrip, ImagePreviewDialog, LifecycleStatusBar,
-                      TokenFrameCoalescer, install_cancel_shortcut)
+from .chat_ui import (ChatTranscript, AttachmentStrip, ErrorRecoveryBanner, ImagePreviewDialog,
+                      LifecycleStatusBar, TokenFrameCoalescer, install_cancel_shortcut)
+from .errors import (SETTINGS_DATABASE, SETTINGS_MCP, SETTINGS_PROFILE, chat_failure, mcp_config_failure,
+                     mcp_provider_failure, model_failure)
 from .lifecycle import SurfaceLifecycleController, SurfaceState
 from .tools import ToolRegistry
 from .tool_catalog import ToolCatalog
@@ -201,7 +203,6 @@ class Gadget(QWidget):
         self._workers = set()
         self._approval_dialog = None
         self._pending_action = None
-        self._turn_has_exchange = False
         self._shutting_down = False
         self.tool_status = ''
         self.workspace = ''
@@ -223,6 +224,10 @@ class Gadget(QWidget):
         self._cancel_partial = None
         self._model_starting = False
         self._mcp_future = None
+        self._mcp_retry = None
+        self._mcp_connecting = False  # Connect / Refresh: failed providers are reported too
+        self._mcp_reported = None
+        self._chat_error = None
         self._render_pending = False
         self._follow_tail = True
         self._drag = None
@@ -334,7 +339,8 @@ class Gadget(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._chat_page(), "Chat")
         self.tabs.addTab(self._history_page(), "History")
-        self.tabs.addTab(self._settings_page(), "Settings")
+        self.settings_tab = self._settings_page()
+        self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.currentChanged.connect(self._on_tab)
         lay.addWidget(self.tabs, 1)
 
@@ -359,6 +365,12 @@ class Gadget(QWidget):
         self.chat_status = LifecycleStatusBar()
         self.chat_status.bind(self.lifecycle)
         lay.addWidget(self.chat_status)
+
+        # Backend / model / tool failures recover inline instead of as raw error text.
+        self.chat_banner = ErrorRecoveryBanner()
+        self.chat_banner.open_settings_requested.connect(self._open_settings)
+        self.chat_banner.dismissed.connect(self._on_chat_error_dismissed)
+        lay.addWidget(self.chat_banner)
 
         srow = QHBoxLayout()
         self.stats_lbl = QLabel()
@@ -525,7 +537,7 @@ class Gadget(QWidget):
         self.db_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         lay.addWidget(self.db_status)
         drow = QHBoxLayout()
-        browse = QPushButton("Browse / select…")
+        browse = self.db_browse_btn = QPushButton("Browse / select…")
         browse.clicked.connect(self._browse_db)
         default = QPushButton("Use default")
         default.clicked.connect(lambda: self._switch_db(DEFAULT_DB))
@@ -744,8 +756,8 @@ class Gadget(QWidget):
 
     def _submit_toggle(self, prof, want_stop):
         job = self.jobs.submit(self._toggle_job, prof, want_stop, self.current_base_url())
-        job.signals.job_completed.connect(lambda result: self._toggle_done(prof, *result))
-        job.signals.job_failed.connect(lambda exc: self._toggle_done(prof, None, str(exc)))
+        job.signals.job_completed.connect(lambda result: self._toggle_done(prof, *result, want_stop))
+        job.signals.job_failed.connect(lambda exc: self._toggle_done(prof, None, str(exc), want_stop))
 
     def _toggle_job(self, prof, want_stop, base_url):
         err = ""
@@ -768,12 +780,19 @@ class Gadget(QWidget):
             err = str(e)
         return service.status(base_url, prof.unit), err
 
-    def _toggle_done(self, prof, status, err):
+    def _toggle_done(self, prof, status, err, stopping=False):
         self._busy_toggle = False
         self._model_starting = False
         self._set_status(status or self.state)
         if err:
-            QMessageBox.warning(self, 'Profile error', f"{prof.label}: {err}")
+            self._present_chat_error(model_failure(
+                prof.label, err, stopping=stopping, retry=lambda: self._retry_toggle(prof, stopping),
+                context={'unit': prof.unit, 'endpoint': self.current_base_url()}))
+
+    def _retry_toggle(self, prof, stopping):
+        # Re-run the same start/stop only if it is still the selected profile and still needed.
+        if self.profile.key == prof.key and not self._busy_toggle and stopping == (self.state != "offline"):
+            self.toggle_service()
 
     def _update_stats(self):
         turns = sum(1 for m in self.msgs if m["role"] == "user")
@@ -794,6 +813,7 @@ class Gadget(QWidget):
     def _update_controls(self):
         self.send_btn.setEnabled(self.state == "online" and self.worker is None)
         self.stop_btn.setEnabled(self.lifecycle.is_active())
+        self.chat_banner.set_retry_blocked(self.worker is not None or self._busy_toggle)
         self.workspace_btn.setEnabled(self.worker is None)
         mcp_tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
         eligible = (bool(self.workspace) or bool(mcp_tools)) and self.profile.key in ('agent-gpu0', 'agent-27b')
@@ -822,40 +842,58 @@ class Gadget(QWidget):
         if self.worker is not None:
             return
         manager = self._ensure_mcp_manager()
-        config = load_config(self.mcp_config_path)
-        self._track_mcp(manager.connect(config))
+        try:
+            future = manager.connect(load_config(self.mcp_config_path))
+        except Exception as exc:  # unreadable / invalid config: recover inline, never crash the slot
+            self._show_tools_inspector()
+            self._tools_inspector_dialog.begin_provider_refresh()
+            self._tools_inspector_dialog.fail_provider_refresh(mcp_config_failure(exc, retry=self._on_mcp_refresh))
+            return
+        self._track_mcp(future, retry=self._on_mcp_refresh, connecting=True)
 
     def _on_mcp_disconnect(self):
         if self.worker is not None or not self.mcp_manager:
             return
-        self._track_mcp(self.mcp_manager.disconnect())
+        self._track_mcp(self.mcp_manager.disconnect(), retry=self._on_mcp_disconnect)
 
     def _on_mcp_config_saved(self, config):
         if self.worker is None and self.mcp_manager:
-            self._track_mcp(self.mcp_manager.disconnect())
+            self._track_mcp(self.mcp_manager.disconnect(), retry=self._on_mcp_disconnect)
 
-    def _track_mcp(self, future):
+    def _track_mcp(self, future, retry=None, connecting=False):
         """The inspector shows Loading (skeleton) until this provider operation settles."""
-        self._mcp_future = future
+        self._mcp_future, self._mcp_retry, self._mcp_connecting = future, retry, connecting
         if self._tools_inspector_dialog is not None:
             self._tools_inspector_dialog.begin_provider_refresh()
         future.add_done_callback(lambda _: self.mcp_snapshot_updated.emit())
 
     def _on_mcp_snapshot_updated(self):
         if self._tools_inspector_dialog is not None:
-            future = self._mcp_future
-            if future is not None and future.done() and (future.cancelled() or future.exception() is not None):
-                self._tools_inspector_dialog.fail_provider_refresh()
             tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
             statuses = self.mcp_manager.statuses() if self.mcp_manager else {}
+            error = self._mcp_failure(statuses)
+            if error is not None:
+                self._tools_inspector_dialog.fail_provider_refresh(error)
             self._tools_inspector_dialog.update_snapshot(tools, statuses, workspace=self.workspace)
         self._update_controls()
+
+    def _mcp_failure(self, statuses):
+        """UiError for the settled provider operation (reported once), or None."""
+        future = self._mcp_future
+        if future is None or not future.done() or future is self._mcp_reported:
+            return None
+        self._mcp_reported = future
+        exc = RuntimeError('MCP operation was cancelled') if future.cancelled() else future.exception()
+        failed = {name: st.get('error', '') for name, st in statuses.items()
+                  if st.get('status') == 'failed'} if self._mcp_connecting else {}
+        return mcp_provider_failure(failed, error=exc, retry=self._mcp_retry)
 
     def _show_tools_inspector(self):
         if self._tools_inspector_dialog is None:
             self._tools_inspector_dialog = ToolInspectorDialog(workspace=self.workspace, parent=self)
             self._tools_inspector_dialog.refresh_requested.connect(self._on_mcp_refresh)
             self._tools_inspector_dialog.disconnect_requested.connect(self._on_mcp_disconnect)
+            self._tools_inspector_dialog.open_settings_requested.connect(self._open_settings)
             self._tools_inspector_dialog.bind_turn(self.lifecycle)
         self._tools_inspector_dialog.set_active_turn(self.worker is not None)
         tools = self.mcp_manager.snapshot() if self.mcp_manager else ()
@@ -873,6 +911,28 @@ class Gadget(QWidget):
         self._mcp_config_dialog.show()
         self._mcp_config_dialog.raise_()
         self._mcp_config_dialog.activateWindow()
+
+    def _open_settings(self, section):
+        """Banner Open Settings: jump to the panel for the failure. The conversation and the
+        banner stay as they are, so Retry is available once the configuration is updated."""
+        if section == SETTINGS_MCP:
+            self._show_mcp_config()
+            return
+        self.tabs.setCurrentWidget(self.settings_tab)
+        target = {SETTINGS_PROFILE: self.profile_cb, SETTINGS_DATABASE: self.db_browse_btn}.get(
+            section, self.endpoint_edit)
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        if target is self.endpoint_edit:
+            self.endpoint_edit.selectAll()
+
+    def _present_chat_error(self, error):
+        self._chat_error = error
+        self.chat_banner.present_error(error)
+        self._update_controls()
+
+    def _on_chat_error_dismissed(self):
+        self._chat_error = None
+        self.lifecycle.dismiss_error()  # Error -> Idle
 
     def _pick_workspace(self):
         if self.worker is not None:
@@ -992,18 +1052,12 @@ class Gadget(QWidget):
         text = self.input.toPlainText().strip()
         if (not text and not self.attachments) or self.worker is not None or self.state != "online":
             return
-        registry = None
-        if self.tools_cb.isChecked():
-            local_reg = None
-            if self.workspace:
-                try:
-                    local_reg = ToolRegistry(self.workspace)
-                except (OSError, ValueError) as exc:
-                    QMessageBox.warning(self, 'Invalid workspace', str(exc))
-                    return
-            snapshot = self.mcp_manager.snapshot() if self.mcp_manager else ()
-            if local_reg or snapshot:
-                registry = ToolCatalog(local_reg, self.mcp_manager, snapshot)
+        try:
+            registry = self._turn_registry()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, 'Invalid workspace', str(exc))
+            return
+        self._discard_unanswered_turn()
         if self.session_id is None:
             title = (text or self.attachments[0]["name"]).splitlines()[0][:48]
             self.session_id = self.db.create_session(self.user, title)
@@ -1013,11 +1067,55 @@ class Gadget(QWidget):
         self.msgs.append(msg)
         self.input.clear()
         self._clear_attachments()
+        self._start_turn(registry)
+
+    def _discard_unanswered_turn(self):
+        """A new message supersedes a previous turn that never got a reply (failed or
+        cancelled before any content came back) instead of stacking two 'user' messages in a
+        row in history/payload - some chat templates reject non-alternating roles. Retry
+        re-dispatches the same stored message directly and never goes through send()."""
+        if self.msgs and self.msgs[-1]['role'] == 'user':
+            stale = self.msgs.pop()
+            self.db.delete_message(stale['id'])
+
+    def _turn_registry(self):
+        """Per-turn tool router (None when tools are off); raises for an invalid workspace."""
+        if not self.tools_cb.isChecked():
+            return None
+        local_reg = ToolRegistry(self.workspace) if self.workspace else None
+        snapshot = self.mcp_manager.snapshot() if self.mcp_manager else ()
+        return ToolCatalog(local_reg, self.mcp_manager, snapshot) if local_reg or snapshot else None
+
+    def _retry_turn(self):
+        """Banner Retry: re-dispatch the failed turn from the conversation as it stands. The
+        original request is already in the transcript and history, so nothing is re-appended."""
+        if self._shutting_down or self.session_id is None or not self.msgs:
+            return
+        if self.worker is not None:  # the failed worker is still winding down
+            self._pending_action = self._retry_turn
+            return
+        try:
+            registry = self._turn_registry()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, 'Invalid workspace', str(exc))
+            if self._chat_error is not None:
+                self._present_chat_error(self._chat_error)  # still failed: keep it actionable
+            return
+        self._start_turn(registry)
+
+    def _turn_context(self):
+        worker = self.worker
+        return {'operation': 'chat turn', 'profile': self.profile.key, 'endpoint': self.current_base_url(),
+                'model': self.model_name or 'unknown',
+                'tools': bool(worker is not None and worker.registry is not None)}
+
+    def _start_turn(self, registry):
+        self.chat_banner.clear_error()  # a new request supersedes the previous failure
+        self._chat_error = None
         self.last_error = ""
         self.reply = ""
         self.last_speed = ""
         self.tool_status = ''
-        self._turn_has_exchange = False
 
         payload = self._payload()
         worker = ChatWorker(payload, base_url=self.current_base_url(), parent=self, registry=registry)
@@ -1152,7 +1250,6 @@ class Gadget(QWidget):
 
     def _on_exchange(self, exchange):
         self.token_coalescer.stop()
-        self._turn_has_exchange = True
         try:
             self.msgs.extend(self.db.add_exchange(self.session_id, exchange))
         except Exception as exc:  # UI persistence boundary
@@ -1224,15 +1321,11 @@ class Gadget(QWidget):
 
     def _on_fail(self, err):
         self.token_coalescer.stop()
-        self.lifecycle.fail()  # Loading|Streaming -> Error; inline recovery hooks in here
-        self.last_error = err
-        if not self._turn_has_exchange and self.msgs and self.msgs[-1]['role'] == 'user':
-            last = self.msgs.pop()
-            self.db.delete_message(last['id'])
-            self.input.setPlainText(last['content'])
-            self.attachments = last['attachments']
-            self._update_attachments()
+        self.lifecycle.fail()  # Loading|Streaming -> Error
+        # The request stays in the conversation so Retry restarts it in place rather than
+        # sending a duplicate; the banner explains the failure in plain language.
         self.reply = ''
+        self._present_chat_error(chat_failure(err, retry=self._retry_turn, context=self._turn_context()))
         self._finish()
 
     def _on_cancelled(self):
@@ -1313,6 +1406,8 @@ class Gadget(QWidget):
         self.msgs, self.session_id = [], None
         self.reply, self.tool_status = '', ''
         self.ctx_used, self.ctx_exact, self.last_speed, self.last_error = 0, True, "", ""
+        self.chat_banner.clear_error()
+        self._chat_error = None
         self.lifecycle.dismiss_error()  # Error -> Idle
         self._update_controls()
         self._update_stats()

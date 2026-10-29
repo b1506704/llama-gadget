@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QFileDialog, QWidget
 )
 
-from .chat_ui import LifecycleStatusBar, SkeletonPlaceholder
+from .chat_ui import ErrorRecoveryBanner, LifecycleStatusBar, SkeletonPlaceholder
 from .lifecycle import SurfaceLifecycleController, SurfaceState
 from .mcp_config import EXAMPLE, parse_config, save_config, load_config
 from .tools import DEFINITIONS
@@ -122,6 +122,7 @@ class MCPConfigDialog(QDialog):
 class ToolInspectorDialog(QDialog):
     refresh_requested = pyqtSignal()
     disconnect_requested = pyqtSignal()
+    open_settings_requested = pyqtSignal(str)
 
     def __init__(self, workspace=None, parent=None):
         super().__init__(parent)
@@ -151,6 +152,12 @@ class ToolInspectorDialog(QDialog):
         self.provider_status = LifecycleStatusBar("Providers")
         self.provider_status.bind(self.lifecycle)
         lay.addWidget(self.provider_status)
+
+        # Provider failures recover inline (Retry / Open Settings / Copy Diagnostics).
+        self.error_banner = ErrorRecoveryBanner()
+        self.error_banner.open_settings_requested.connect(self.open_settings_requested.emit)
+        self.error_banner.dismissed.connect(self.lifecycle.dismiss_error)
+        lay.addWidget(self.error_banner)
 
         # Active chat turn (shared controller from the main window) with its own Stop.
         turn_row = QHBoxLayout()
@@ -209,6 +216,7 @@ class ToolInspectorDialog(QDialog):
     def set_active_turn(self, active: bool):
         self.refresh_btn.setEnabled(not active)
         self.disconnect_btn.setEnabled(not active)
+        self.error_banner.set_retry_blocked(active)
 
     def bind_turn(self, controller):
         """Mirror the main window's turn lifecycle here; Stop cancels it."""
@@ -234,10 +242,14 @@ class ToolInspectorDialog(QDialog):
 
     def begin_provider_refresh(self):
         """Connect / Refresh / Disconnect started: skeleton replaces the tree until the snapshot arrives."""
+        self.error_banner.clear_error()  # a new attempt supersedes the previous failure
         return self.lifecycle.start_operation()
 
-    def fail_provider_refresh(self):
+    def fail_provider_refresh(self, error=None):
+        """Provider operation failed: Loading -> Error, with the UiError shown inline."""
         self.lifecycle.fail()
+        if error is not None:
+            self.error_banner.present_error(error)
 
     def _on_provider_state(self, state):
         loading = state is SurfaceState.LOADING

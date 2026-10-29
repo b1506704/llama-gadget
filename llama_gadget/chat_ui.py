@@ -9,6 +9,7 @@ from PyQt6.QtGui import QDesktopServices, QIcon, QKeySequence, QPixmap, QShortcu
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar,
                              QPushButton, QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget)
 
+from .errors import sanitize_diagnostics
 from .images import decode_attachment_image
 from .lifecycle import SurfaceState
 from .theme import TOKENS
@@ -182,6 +183,122 @@ def install_cancel_shortcut(surface: QWidget, cancel) -> QShortcut:
         cancel()
     shortcut.activated.connect(on_escape)
     return shortcut
+
+
+class ErrorRecoveryBanner(QFrame):
+    """Inline failure banner shared by the chat and tool surfaces.
+
+    Shows a UiError's plain-language summary (never raw exception text) with Retry,
+    Open Settings and Copy Diagnostics. Retry clears the banner before invoking the
+    error's retry callback; Open Settings and Copy Diagnostics leave it in place so the
+    user can retry after fixing the configuration. Lifecycle transitions are the parent
+    surface's job (via the retry callback and ``dismissed``)."""
+    retry_requested = pyqtSignal(object)
+    open_settings_requested = pyqtSignal(str)
+    diagnostics_copied = pyqtSignal(str)
+    dismissed = pyqtSignal()
+    CONFIRM_MS = 2500
+
+    def __init__(self, parent=None, tokens=TOKENS):
+        super().__init__(parent)
+        self.error = None
+        self._retry_blocked = False
+        t = tokens
+        self.setObjectName('errorBanner')
+        self.setStyleSheet(
+            f'QFrame#errorBanner {{ background: {t.error_surface}; border: 1px solid {t.error}; '
+            f'border-radius: {t.radius}px; }} '
+            f'QFrame#errorBanner QLabel {{ background: transparent; border: none; }}')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2 * t.spacing, 2 * t.spacing, 2 * t.spacing, 2 * t.spacing)
+        layout.setSpacing(t.spacing)
+        top = QHBoxLayout()
+        self.title_lbl = QLabel('Something went wrong')
+        self.title_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self.title_lbl.setStyleSheet(f'color: {t.error}; font-weight: bold;')
+        self.dismiss_btn = QPushButton('✕')
+        self.dismiss_btn.setToolTip('Dismiss')
+        self.dismiss_btn.setFixedWidth(6 * t.spacing)
+        self.dismiss_btn.clicked.connect(self.dismiss)
+        top.addWidget(self.title_lbl, 1)
+        top.addWidget(self.dismiss_btn)
+        layout.addLayout(top)
+        self.summary_lbl = QLabel()
+        self.summary_lbl.setTextFormat(Qt.TextFormat.PlainText)  # never interpreted as rich text
+        self.summary_lbl.setWordWrap(True)
+        self.summary_lbl.setStyleSheet(f'color: {t.text};')
+        layout.addWidget(self.summary_lbl)
+        actions = QHBoxLayout()
+        self.retry_btn = QPushButton('Retry')
+        self.retry_btn.clicked.connect(self.retry)
+        self.settings_btn = QPushButton('Open Settings')
+        self.settings_btn.clicked.connect(self.open_settings)
+        self.copy_btn = QPushButton('Copy Diagnostics')
+        self.copy_btn.setToolTip('Copy a report with secrets, tokens and local paths redacted')
+        self.copy_btn.clicked.connect(self.copy_diagnostics)
+        self.copied_lbl = QLabel('Sanitized diagnostics copied to clipboard')
+        self.copied_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self.copied_lbl.setStyleSheet(f'color: {t.success}; font-size: {t.font_small}px;')
+        self.copied_lbl.hide()
+        for button in (self.retry_btn, self.settings_btn, self.copy_btn):
+            actions.addWidget(button)
+        actions.addWidget(self.copied_lbl, 1)
+        layout.addLayout(actions)
+        self.confirm_timer = QTimer(self, interval=self.CONFIRM_MS, singleShot=True)
+        self.confirm_timer.timeout.connect(self.copied_lbl.hide)
+        self.hide()
+
+    def present_error(self, error) -> None:
+        self.error = error
+        self.summary_lbl.setText(error.summary)
+        self.retry_btn.setVisible(error.can_retry)
+        self.settings_btn.setVisible(bool(error.settings_section))
+        self._sync_retry()
+        self.confirm_timer.stop()
+        self.copied_lbl.hide()
+        self.show()
+
+    def clear_error(self) -> None:
+        self.error = None
+        self.confirm_timer.stop()
+        self.copied_lbl.hide()
+        self.hide()
+
+    def set_retry_blocked(self, blocked: bool) -> None:
+        """Disable Retry while another operation owns the surface (e.g. an active turn)."""
+        self._retry_blocked = bool(blocked)
+        self._sync_retry()
+
+    def _sync_retry(self):
+        self.retry_btn.setEnabled(not self._retry_blocked)
+
+    def retry(self) -> None:
+        error = self.error
+        if error is None or not error.can_retry or self._retry_blocked:
+            return
+        self.clear_error()  # first, so a synchronous re-failure can present a fresh banner
+        error.retry_callback()
+        self.retry_requested.emit(error)
+
+    def open_settings(self) -> None:
+        if self.error is not None and self.error.settings_section:
+            self.open_settings_requested.emit(self.error.settings_section)
+
+    def copy_diagnostics(self) -> str:
+        if self.error is None:
+            return ''
+        report = sanitize_diagnostics(self.error)
+        QApplication.clipboard().setText(report)
+        self.copied_lbl.show()
+        self.confirm_timer.start()
+        self.diagnostics_copied.emit(report)
+        return report
+
+    def dismiss(self) -> None:
+        if self.error is None:
+            return
+        self.clear_error()
+        self.dismissed.emit()
 
 
 class MarkdownBody(QTextBrowser):

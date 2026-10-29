@@ -144,7 +144,10 @@ class AppToolsTests(unittest.TestCase):
         self.assertTrue(pump_until(lambda: self.app.worker is None))
         self.assertTrue((self.root / 'new').exists())
         self.assertEqual([m['role'] for m in self.app.msgs], ['user', 'assistant', 'tool'])
-        self.assertTrue(self.app.last_error)
+        # The failure is surfaced inline (banner), not as raw error text in the transcript.
+        self.assertIsNotNone(self.app.chat_banner.error)
+        self.assertTrue(self.app.chat_banner.error.can_retry)
+        self.assertEqual(self.app.last_error, '')
 
     def test_new_session_cancels_approval_and_retains_thread(self):
         self.setup_tools()
