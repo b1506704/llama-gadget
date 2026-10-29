@@ -12,7 +12,7 @@ from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                             QMessageBox, QPushButton, QSystemTrayIcon, QTabWidget, QTextBrowser,
+                             QMessageBox, QPushButton, QStackedWidget, QSystemTrayIcon, QTextBrowser,
                              QTextEdit, QVBoxLayout, QWidget)
 
 from . import profiles, service
@@ -24,12 +24,15 @@ from .mcp_config import default_config_path, load_config
 from .mcp_client import MCPManager
 from .tool_ui import ToolInspectorDialog, MCPConfigDialog
 from .db import DEFAULT_DB, Database
+from .layout import WorkspaceSplitter
+from .theme import DARK_TOKENS
 from .images import encode_image, is_image, load_image
 from .files import (UnsupportedFile, build_folder_context, parse_file, read_candidates,
                     scan_folder)
 
 DEFAULT_USER = socket.gethostname()  # PC name
 COLORS = {"online": "#3fb950", "loading": "#d29922", "offline": "#f85149"}
+VIEWS = (("chat", "💬 Chat"), ("settings", "⚙ Settings"))  # primary-canvas views, in stack order
 
 
 def clean_endpoint(url: str) -> str:
@@ -51,9 +54,6 @@ QListWidget::item:selected { background: #2a3140; }
 QPushButton { background: #2a2e35; color: #e6e8eb; border: none; border-radius: 6px; padding: 5px 10px; }
 QPushButton:hover { background: #363b44; }
 QPushButton:disabled { color: #6b7078; }
-QTabWidget::pane { border: none; }
-QTabBar::tab { background: #1b1e24; color: #9aa0a8; padding: 5px 12px; border-radius: 6px; margin-right: 3px; }
-QTabBar::tab:selected { background: #2a3140; color: #e6e8eb; }
 QMenu { background: #1b1e24; color: #e6e8eb; border: 1px solid #2a2e35; }
 QMenu::item:selected { background: #2a3140; }
 """
@@ -230,6 +230,7 @@ class Gadget(QWidget):
         self.msgs = []
         self.session_id = None
         self.attachments = []
+        self._view_state = {}  # session id -> (unsent draft, scroll value or None when at bottom)
 
         self.user = self.settings.value("user", DEFAULT_USER) or DEFAULT_USER
         self.db = Database()
@@ -243,7 +244,7 @@ class Gadget(QWidget):
 
         self.setWindowTitle("Llama Gadget")
         self.setAcceptDrops(True)
-        self.resize(420, 660)
+        self.resize(1120, 720)
         self._build_ui()
         self.setStyleSheet(STYLE)
 
@@ -302,6 +303,53 @@ class Gadget(QWidget):
         top.addWidget(close)
         lay.addLayout(top)
 
+        # Inspector first: the chat page's control refresh reads its tool widgets.
+        inspector = self._inspector()
+        sidebar = self._sidebar()
+        self.canvas = QStackedWidget()
+        self.canvas.addWidget(self._chat_page())
+        self.canvas.addWidget(self._settings_page())
+        self.zones = WorkspaceSplitter(sidebar, self.canvas, inspector)
+        self.zones.apply_theme(DARK_TOKENS)
+        lay.addWidget(self.zones, 1)
+        self._show_view("chat")
+
+        self.db_footer = QLabel()
+        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
+        lay.addWidget(self.db_footer)
+        self._update_controls()
+
+    def _sidebar(self):
+        """Navigation & session zone: canvas views plus this user's sessions."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        self.nav = QListWidget()
+        self.nav.setSizeAdjustPolicy(QListWidget.SizeAdjustPolicy.AdjustToContents)
+        for key, label in VIEWS:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            self.nav.addItem(item)
+        self.nav.currentRowChanged.connect(self._on_nav)
+        lay.addWidget(self.nav)
+        self.hist_user_lbl = QLabel()
+        lay.addWidget(self.hist_user_lbl)
+        self.hist_list = QListWidget()
+        self.hist_list.itemClicked.connect(lambda _: self._open_selected())
+        lay.addWidget(self.hist_list, 1)
+        row = QHBoxLayout()
+        for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
+                         ("Refresh", self._refresh_history)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        return w
+
+    def _inspector(self):
+        """Contextual inspector & model drawer: profile, endpoint, GPUs, tool options."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel("<b>Model</b>"))
         prow = QHBoxLayout()
         prow.addWidget(QLabel("Profile"))
         self.profile_cb = QComboBox()
@@ -314,6 +362,7 @@ class Gadget(QWidget):
 
         erow = QHBoxLayout()
         self.endpoint_lbl = QLabel()
+        self.endpoint_lbl.setWordWrap(True)
         self.endpoint_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.endpoint_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
         self.endpoint_lbl.setText(f"Endpoint: {self.current_base_url()}/v1\nModel: –")
@@ -325,21 +374,54 @@ class Gadget(QWidget):
         erow.addWidget(self.edit_ep_btn)
         lay.addLayout(erow)
 
+        self.gpu_lbl = QLabel("GPU: …")
+        self.gpu_lbl.setWordWrap(True)
+        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
+        lay.addWidget(self.gpu_lbl)
+
+        lay.addWidget(QLabel("<b>Tools</b>"))
+        self.tools_cb = QCheckBox('Enable tools')
+        self.tools_cb.setToolTip('Agent profiles only. Reads/listings auto-run in the workspace; writes and bash require approval.')
+        self.tools_cb.toggled.connect(lambda _: self._update_controls())
+        lay.addWidget(self.tools_cb)
+        tools_row = QHBoxLayout()
+        self.workspace_btn = QPushButton('Workspace…')
+        self.workspace_btn.clicked.connect(self._pick_workspace)
+        self.tools_btn = QPushButton('Tools…')
+        self.tools_btn.clicked.connect(self._show_tools_inspector)
+        tools_row.addWidget(self.workspace_btn)
+        tools_row.addWidget(self.tools_btn)
+        lay.addLayout(tools_row)
+        self.show_tools_cb = QCheckBox('Show tool details')
+        self.show_tools_cb.setChecked(self.settings.value('show_tool_details', False, bool))
+        self.show_tools_cb.toggled.connect(self._toggle_tool_details)
+        self.yolo_cb = QCheckBox('YOLO mode')
+        self.yolo_cb.setToolTip('Auto-approve all tool calls (bash commands, file writes, MCP) without prompting')
+        self.yolo_cb.setChecked(self.settings.value('yolo_mode', False, bool))
+        self.yolo_cb.toggled.connect(self._toggle_yolo_mode)
+        lay.addWidget(self.show_tools_cb)
+        lay.addWidget(self.yolo_cb)
+        self.workspace_lbl = QLabel('Select a workspace to enable tools')
+        self.workspace_lbl.setWordWrap(True)
+        lay.addWidget(self.workspace_lbl)
+
+        lay.addWidget(QLabel("<b>Window</b>"))
         self.gadget_cb = QCheckBox("Gadget mode (frameless, on top)")
         self.gadget_cb.toggled.connect(self._apply_gadget)
         lay.addWidget(self.gadget_cb)
+        lay.addStretch()
+        return w
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._chat_page(), "Chat")
-        self.tabs.addTab(self._history_page(), "History")
-        self.tabs.addTab(self._settings_page(), "Settings")
-        self.tabs.currentChanged.connect(self._on_tab)
-        lay.addWidget(self.tabs, 1)
+    def _show_view(self, key):
+        self.nav.setCurrentRow(next(i for i, (k, _) in enumerate(VIEWS) if k == key))
 
-        self.db_footer = QLabel()
-        self.db_footer.setStyleSheet("color:#8b949e; font-size:11px;")
-        lay.addWidget(self.db_footer)
-        self._update_controls()
+    def _on_nav(self, row):
+        if row < 0:
+            return
+        # Switching the stacked canvas keeps each page's widgets, so drafts and scroll survive.
+        self.canvas.setCurrentIndex(row)
+        if VIEWS[row][0] == "settings":
+            self._refresh_db_status()
 
     def _chat_page(self):
         w = QWidget()
@@ -368,10 +450,6 @@ class Gadget(QWidget):
         srow.addWidget(self.scroll_bottom_btn)
         lay.addLayout(srow)
 
-        self.gpu_lbl = QLabel("GPU: …")
-        self.gpu_lbl.setStyleSheet("color:#8b949e; font-size:11px;")
-        lay.addWidget(self.gpu_lbl)
-
         self.attach_lbl = AttachmentStrip()
         self.attach_lbl.image_requested.connect(self._preview_image)
         self.attach_clear = QPushButton("Clear files")
@@ -389,34 +467,6 @@ class Gadget(QWidget):
         self.input.clip_menu.connect(self._show_clip_menu)
         self.input.image_pasted.connect(self._paste_image)
         lay.addWidget(self.input)
-
-        tools_row = QHBoxLayout()
-        self.tools_cb = QCheckBox('Enable tools')
-        self.tools_cb.setToolTip('Agent profiles only. Reads/listings auto-run in the workspace; writes and bash require approval.')
-        self.tools_cb.toggled.connect(lambda _: self._update_controls())
-        self.workspace_btn = QPushButton('Workspace…')
-        self.workspace_btn.clicked.connect(self._pick_workspace)
-        self.tools_btn = QPushButton('Tools…')
-        self.tools_btn.clicked.connect(self._show_tools_inspector)
-        tools_row.addWidget(self.tools_cb)
-        tools_row.addWidget(self.workspace_btn)
-        tools_row.addWidget(self.tools_btn)
-        lay.addLayout(tools_row)
-        options_row = QHBoxLayout()
-        self.show_tools_cb = QCheckBox('Show tool details')
-        self.show_tools_cb.setChecked(self.settings.value('show_tool_details', False, bool))
-        self.show_tools_cb.toggled.connect(self._toggle_tool_details)
-        self.yolo_cb = QCheckBox('YOLO mode')
-        self.yolo_cb.setToolTip('Auto-approve all tool calls (bash commands, file writes, MCP) without prompting')
-        self.yolo_cb.setChecked(self.settings.value('yolo_mode', False, bool))
-        self.yolo_cb.toggled.connect(self._toggle_yolo_mode)
-        options_row.addWidget(self.show_tools_cb)
-        options_row.addWidget(self.yolo_cb)
-        options_row.addStretch()
-        lay.addLayout(options_row)
-        self.workspace_lbl = QLabel('Select a workspace to enable tools')
-        self.workspace_lbl.setWordWrap(True)
-        lay.addWidget(self.workspace_lbl)
 
         row = QHBoxLayout()
         self.refresh_btn = QPushButton("New session")
@@ -446,24 +496,6 @@ class Gadget(QWidget):
         lay.addLayout(row)
         self._update_controls()
         self._update_stats()
-        return w
-
-    def _history_page(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 4, 0, 0)
-        self.hist_user_lbl = QLabel()
-        lay.addWidget(self.hist_user_lbl)
-        self.hist_list = QListWidget()
-        self.hist_list.itemDoubleClicked.connect(lambda _: self._open_selected())
-        lay.addWidget(self.hist_list, 1)
-        row = QHBoxLayout()
-        for text, fn in (("Open", self._open_selected), ("Delete", self._delete_selected),
-                         ("Refresh", self._refresh_history)):
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            row.addWidget(b)
-        lay.addLayout(row)
         return w
 
     def _settings_page(self):
@@ -577,7 +609,7 @@ class Gadget(QWidget):
         self._add_files([p for p in paths if not Path(p).is_dir()])
         for d in (p for p in paths if Path(p).is_dir()):
             self._add_folder(d)
-        self.tabs.setCurrentIndex(0)
+        self._show_view("chat")
 
     # ---------------------------------------------------------------- service / stats
     def current_base_url(self) -> str:
@@ -1186,6 +1218,7 @@ class Gadget(QWidget):
         self.msgs, self.session_id = [], None
         self.reply, self.tool_status = '', ''
         self.ctx_used, self.ctx_exact, self.last_speed, self.last_error = 0, True, "", ""
+        self._highlight_session()
         self._update_controls()
         self._update_stats()
         self._render()
@@ -1296,12 +1329,6 @@ class Gadget(QWidget):
         self._refresh_db_status()
 
     # ---------------------------------------------------------------- history
-    def _on_tab(self, i):
-        if i == 1:
-            self._refresh_history()
-        elif i == 2:
-            self._refresh_db_status()
-
     def _refresh_history(self):
         self.hist_user_lbl.setText(f"Sessions for <b>{escape(self.user)}</b>")
         self.hist_list.clear()
@@ -1310,6 +1337,17 @@ class Gadget(QWidget):
                                    f"{fmt_ts(updated)} · {n} messages · started {fmt_ts(created)}")
             item.setData(Qt.ItemDataRole.UserRole, sid)
             self.hist_list.addItem(item)
+        self._highlight_session()
+
+    def _highlight_session(self):
+        """Mark the active session in the navigation sidebar."""
+        self.hist_list.clearSelection()
+        for i in range(self.hist_list.count()):
+            item = self.hist_list.item(i)
+            active = item.data(Qt.ItemDataRole.UserRole) == self.session_id
+            item.setText(("▶ " if active else "") + item.text().removeprefix("▶ "))
+            if active:
+                self.hist_list.setCurrentItem(item)
 
     def _selected_sid(self):
         it = self.hist_list.currentItem()
@@ -1319,13 +1357,28 @@ class Gadget(QWidget):
         sid = self._selected_sid()
         if sid is None:
             return
+        if sid == self.session_id:
+            self._show_view("chat")
+            return
         if self.worker:
             self._pending_action = lambda: self._load_session(sid)
             self.stop_turn()
             return
         self._load_session(sid)
 
+    def _remember_view(self):
+        bar = self.view.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 48
+        self._view_state[self.session_id] = (self.input.toPlainText(), None if at_bottom else bar.value())
+
+    def _restore_view(self, sid):
+        draft, scroll = self._view_state.pop(sid, ("", None))
+        self.input.setPlainText(draft)
+        bar = self.view.verticalScrollBar()
+        bar.setValue(bar.maximum() if scroll is None else min(scroll, bar.maximum()))
+
     def _load_session(self, sid):
+        self._remember_view()
         self.new_session()
         self.session_id = sid
         self.msgs = self.db.load_messages(sid)
@@ -1334,8 +1387,9 @@ class Gadget(QWidget):
         self.ctx_exact = False
         self._update_stats()
         self._render()
-        self.tabs.setCurrentIndex(0)
-        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().maximum())
+        self._show_view("chat")
+        self._highlight_session()
+        self._restore_view(sid)
 
     def _delete_selected(self):
         sid = self._selected_sid()

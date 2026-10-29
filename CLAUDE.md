@@ -41,6 +41,8 @@ Three threads cooperate: the Qt UI thread (`Gadget` in `app.py`), one `ChatWorke
 
 **Supporting modules.** `files.py` parses attachments (incl. `.docx` via zip+XML, `.pdf` via `pdftotext`/`pypdf`) and does the git-aware folder-context scan; `images.py` downscales vision attachments to ≤1568px, flattens alpha onto white, and embeds as JPEG data URLs; `chat_ui.py`/`tool_ui.py` hold dialogs and per-message widgets.
 
+**Workspace layout.** `Gadget` is a three-zone `WorkspaceSplitter` (`layout/`): navigation/session sidebar, a stacked primary canvas (Chat / Settings), and an inspector (profile, endpoint, GPUs, tool options). Side panels have min/max `PanelBounds`; spare width goes to the canvas. Zone styling goes through `theme/` (`ThemeTokens` → `ThemeAdapter`); `python -m llama_gadget.theme.lint` rejects raw hex/rgb/px literals in `layout/` and the adapter.
+
 ## Design docs
 
 Feature specs, plans, and execution logs live in `docs/superpowers/{specs,plans,execution}/` — check the matching dated doc before extending tool calling or MCP behavior.
