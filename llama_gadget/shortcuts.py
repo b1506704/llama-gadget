@@ -244,11 +244,12 @@ class ShortcutCheatSheetDialog(QDialog):
 
     def __init__(self, registry, tokens, parent=None, platform=None):
         super().__init__(parent)
+        tokens = tokens() if callable(tokens) else tokens
         self.setWindowTitle('Keyboard shortcuts')
         self.setModal(True)
         self.setStyleSheet(stylesheet(tokens) + f"""
-            QTreeWidget#shortcuts {{ font-size: 12px; }}
-            QLabel#title {{ color: {tokens.text_strong}; font-size: 14px; font-weight: bold; }}""")
+            QTreeWidget#shortcuts {{ font-size: {tokens.typography.body.size}px; }}
+            QLabel#title {{ color: {tokens.text_strong}; font-size: {tokens.typography.heading.size}px; font-weight: bold; }}""")
         self.resize(520, 560)
         layout = QVBoxLayout(self)
         title = QLabel('Keyboard shortcuts', objectName='title')
@@ -305,6 +306,7 @@ class ShortcutCheatSheetDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self.activateWindow()
+        QApplication.setActiveWindow(self)
         self.tree.setFocus(Qt.FocusReason.PopupFocusReason)
 
     def exec_and_restore_focus(self):

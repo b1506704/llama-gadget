@@ -175,6 +175,7 @@ class CommandPaletteDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self.activateWindow()
+        QApplication.setActiveWindow(self)
         self.search.setFocus(Qt.FocusReason.PopupFocusReason)
 
     def refilter(self, text):

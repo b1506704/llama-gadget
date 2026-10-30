@@ -254,3 +254,78 @@ class AppToolsTests(unittest.TestCase):
         self.assertIsNone(self.app._approval_dialog)
         self.assertTrue((self.root / 'yolo_test.txt').exists())
         self.assertEqual((self.root / 'yolo_test.txt').read_text(), 'auto approved!')
+
+    def test_usage_chunk_updates_stats_without_error(self):
+        # llama.cpp ends every streamed turn with a usage chunk; a handler with a
+        # mismatched signature aborts the whole process when the signal is queued.
+        self.setup_tools()
+        self.server([
+            [chunk({'content': 'Hi'}), chunk(finish='stop'),
+             {'usage': {'prompt_tokens': 120, 'completion_tokens': 45, 'total_tokens': 165},
+              'timings': {'prompt_per_second': 890.5, 'predicted_per_second': 42.7}}, '[DONE]'],
+        ])
+        self.app.input.setPlainText('Hello')
+        self.app.send()
+        self.assertTrue(pump_until(lambda: self.app.worker is None))
+        self.assertEqual(self.app.last_error, '')
+        self.assertTrue(self.app.ctx_exact)
+        self.assertEqual(self.app.ctx_used, 165)
+        self.assertIn('42.7 tok/s', self.app.stats_lbl.text())
+
+    def test_clip_menu_lists_history_without_unpack_error(self):
+        # list_clips returns plain texts; unpacking 3-tuples aborted the app on click.
+        self.app.db.add_clip('first clip')
+        self.app.db.add_clip('second clip that is long enough to be trimmed with…')
+        menus = []
+        from PyQt6.QtWidgets import QMenu
+        orig_exec = QMenu.exec
+
+        def fake_exec(menu_self, pos):
+            menus.append([a.text() for a in menu_self.actions() if a.text()])
+            return None
+        with patch.object(QMenu, 'exec', fake_exec):
+            self.app._show_clip_menu()
+        self.assertEqual(len(menus), 1)
+        self.assertTrue(any('first clip' in t for t in menus[0]))
+        self.assertTrue(any('Clear clipboard history' in t for t in menus[0]))
+
+    def test_attach_image_file_records_path_and_dedupes(self):
+        # Regression: encode_image() got an unexpected keyword argument 'path'
+        from PyQt6.QtGui import QColor, QImage
+        from llama_gadget.images import load_image
+        self.app.profile = profiles.PROFILES['vision']
+        jpeg = self.root / 'HTxn11yaEAABpRH.jpeg'
+        img = QImage(32, 16, QImage.Format.Format_RGB32)
+        img.fill(QColor('red'))
+        self.assertTrue(img.save(str(jpeg), 'JPEG'))
+
+        self.app._add_attachment(str(jpeg))
+        self.assertEqual(len(self.app.attachments), 1)
+        att = self.app.attachments[0]
+        self.assertEqual(att['name'], 'HTxn11yaEAABpRH.jpeg')
+        self.assertEqual(att['path'], str(jpeg))
+        self.assertIn('data:image/jpeg;base64,', att['data'])
+
+        self.app._add_attachment(str(jpeg))  # same file twice: silently deduplicated
+        self.assertEqual(len(self.app.attachments), 1)
+
+    def test_image_pasted_accepts_qimage_and_preencoded(self):
+        # Regression: drag-drop emitted a pre-encoded dict into the encode path.
+        from PyQt6.QtGui import QColor, QImage
+        from llama_gadget.images import load_image
+        self.app.profile = profiles.PROFILES['vision']
+
+        img = QImage(32, 16, QImage.Format.Format_RGB32)
+        img.fill(QColor('blue'))
+        self.app._on_image_pasted(img)
+        self.assertEqual(len(self.app.attachments), 1)
+        self.assertTrue(self.app.attachments[0]['name'].startswith('Pasted-Image-'))
+
+        png = self.root / 'x.png'
+        img2 = QImage(16, 16, QImage.Format.Format_RGB32)
+        img2.fill(QColor('green'))
+        self.assertTrue(img2.save(str(png), 'PNG'))
+        dropped = load_image(str(png))
+        self.app._on_image_pasted(dropped)
+        self.assertEqual(len(self.app.attachments), 2)
+        self.assertIs(self.app.attachments[1], dropped)

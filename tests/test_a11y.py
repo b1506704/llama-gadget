@@ -44,7 +44,8 @@ class GadgetCase(unittest.TestCase):
         settings = QSettings(str(root / 'settings.ini'), QSettings.Format.IniFormat)
         settings.setValue('db_path', str(root / 'chat.db'))
         settings.setValue('profile', 'agent-gpu0')
-        with patch('llama_gadget.app.QSettings', return_value=settings), patch.object(Gadget, '_poll'):
+        with patch('llama_gadget.app.QSettings', return_value=settings), patch.object(Gadget, '_poll'), \
+                patch('llama_gadget.app.default_preferences_path', return_value=root / 'preferences.json'):
             self.app = Gadget()
         self.app.timer.stop()
         self.addCleanup(self.cleanup_app)

@@ -65,6 +65,17 @@ class LayoutController(QObject):
         """The width the panel has (or returns to) when expanded."""
         return self.saved_widths[zone]
 
+    def set_collapsed(self, zone: PanelZone | WorkspaceZone, collapsed: bool) -> None:
+        zone_str = zone.value if hasattr(zone, 'value') else str(zone)
+        if zone_str in PANEL_ZONES:
+            if self.is_panel_collapsed(zone_str) != bool(collapsed):
+                self.toggle_panel(zone_str)
+
+    def ensure_visible(self, zone: PanelZone | WorkspaceZone) -> None:
+        zone_str = zone.value if hasattr(zone, 'value') else str(zone)
+        if zone_str in PANEL_ZONES:
+            self.set_collapsed(zone_str, False)
+
     def restore(self, widths, collapsed):
         """Seed remembered widths and the user's collapsed flags (e.g. from saved preferences)."""
         for zone in PANEL_ZONES:
