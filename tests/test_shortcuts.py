@@ -55,7 +55,8 @@ class GadgetCase(unittest.TestCase):
         root = Path(self.temp.name)
         settings = QSettings(str(root / 'settings.ini'), QSettings.Format.IniFormat)
         settings.setValue('db_path', str(root / 'chat.db'))
-        with patch('llama_gadget.app.QSettings', return_value=settings), patch.object(Gadget, '_poll'):
+        with patch('llama_gadget.app.QSettings', return_value=settings), patch.object(Gadget, '_poll'), \
+                patch('llama_gadget.app.default_preferences_path', return_value=root / 'preferences.json'):
             gadget = Gadget()
         gadget.timer.stop()
         self.addCleanup(self._cleanup, gadget)

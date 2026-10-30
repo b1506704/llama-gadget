@@ -1,7 +1,7 @@
 """Runtime theme state: user preference + OS appearance -> the active ThemeTokens palette."""
 from enum import Enum
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 
 from .palettes import DARK_TOKENS, LIGHT_TOKENS
@@ -30,12 +30,32 @@ class SystemAppearance(str, Enum):
 _PALETTES = {SystemAppearance.DARK: DARK_TOKENS, SystemAppearance.LIGHT: LIGHT_TOKENS}
 
 
-class ThemeController:
+class ThemeController(QObject):
     """Holds the selected preference and last known OS appearance; resolves the shared palette."""
+    changed = pyqtSignal(object)
 
-    def __init__(self, preference=ThemePreference.SYSTEM, system_appearance=SystemAppearance.DARK):
-        self._preference = ThemePreference(preference)
-        self._system_appearance = SystemAppearance(system_appearance)
+    def __init__(self, preference=ThemePreference.SYSTEM, system_appearance=SystemAppearance.DARK, parent=None):
+        super().__init__(parent)
+        if isinstance(preference, QSettings):
+            self.settings = preference
+            stored = self.settings.value('theme', 'dark')
+            self.mode = stored if stored in ('dark', 'light') else 'dark'
+            self._preference = ThemePreference.DARK if self.mode == 'dark' else ThemePreference.LIGHT
+            self._system_appearance = SystemAppearance.DARK
+        else:
+            self.settings = None
+            if isinstance(preference, str) and preference in ('dark', 'light', 'system'):
+                self._preference = ThemePreference(preference)
+            elif isinstance(preference, ThemePreference):
+                self._preference = preference
+            else:
+                self._preference = ThemePreference.SYSTEM
+            self._system_appearance = SystemAppearance(system_appearance)
+            self.mode = self._preference.value if self._preference is not ThemePreference.SYSTEM else 'dark'
+
+    @property
+    def tokens(self) -> ThemeTokens:
+        return self.active_tokens()
 
     def preference(self) -> ThemePreference:
         return self._preference
@@ -45,11 +65,32 @@ class ThemeController:
 
     def set_preference(self, preference) -> ThemeTokens:
         self._preference = ThemePreference(preference)
-        return self.active_tokens()
+        if self._preference is not ThemePreference.SYSTEM:
+            self.mode = self._preference.value
+        toks = self.active_tokens()
+        self.changed.emit(toks)
+        return toks
 
     def set_system_appearance(self, appearance) -> ThemeTokens:
         self._system_appearance = SystemAppearance(appearance)
-        return self.active_tokens()
+        toks = self.active_tokens()
+        self.changed.emit(toks)
+        return toks
+
+    def set_mode(self, mode: str) -> ThemeTokens:
+        if mode not in ('dark', 'light'):
+            raise ValueError(f'unknown theme: {mode}')
+        self.mode = mode
+        self._preference = ThemePreference(mode)
+        toks = self.active_tokens()
+        if self.settings is not None:
+            self.settings.setValue('theme', mode)
+        self.changed.emit(toks)
+        return toks
+
+    def toggle(self) -> ThemeTokens:
+        new_mode = 'light' if self.mode == 'dark' else 'dark'
+        return self.set_mode(new_mode)
 
     def active_appearance(self) -> SystemAppearance:
         if self._preference is ThemePreference.SYSTEM:

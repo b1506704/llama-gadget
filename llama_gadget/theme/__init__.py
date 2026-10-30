@@ -2,7 +2,7 @@
 from .tokens import (DEFAULT_RADII, DEFAULT_SPACING, DEFAULT_TYPOGRAPHY, Color, CornerRadii,
                      SemanticColors, SpacingScale, ThemeTokens, TypeToken, TypographyScale)
 from .palettes import DARK_TOKENS, LIGHT_TOKENS
-from .adapter import ThemeAdapter
+from .adapter import ThemeAdapter, contrast_ratio
 from .controller import (SystemAppearance, ThemeController, ThemePreference,
                          appearance_from_color_scheme, detect_system_appearance)
 from .store import (JsonThemePreferenceStore, ThemePersistError, ThemePreferenceStore,
@@ -12,11 +12,13 @@ from .current import (active_adapter, active_tokens, bind_theme, set_active_adap
 
 DARK = DARK_TOKENS
 LIGHT = LIGHT_TOKENS
+TOKENS = DARK_TOKENS
+THEMES = {'dark': DARK_TOKENS, 'light': LIGHT_TOKENS}
 
 
 def stylesheet(tokens=None, scale=1.0, base_pt=10.0):
     """Return the application stylesheet for the given tokens (or current active theme)."""
-    toks = tokens or active_tokens()
+    toks = tokens() if callable(tokens) else (tokens or active_tokens())
     adapter = ThemeAdapter(toks)
     if hasattr(adapter, 'stylesheet'):
         return adapter.stylesheet(scale=scale, base_pt=base_pt)
@@ -37,4 +39,4 @@ __all__ = ['Color', 'CornerRadii', 'DEFAULT_RADII', 'DEFAULT_SPACING', 'DEFAULT_
            'TypeToken', 'TypographyScale', 'appearance_from_color_scheme',
            'active_adapter', 'active_tokens', 'bind_theme', 'default_preferences_path',
            'detect_system_appearance', 'set_active_adapter', 'theme_hub',
-           'DARK', 'LIGHT', 'stylesheet', 'toggle']
+           'DARK', 'LIGHT', 'TOKENS', 'THEMES', 'contrast_ratio', 'stylesheet', 'toggle']

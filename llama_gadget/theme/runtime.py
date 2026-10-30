@@ -8,6 +8,25 @@ from .controller import (SystemAppearance, ThemeController, ThemePreference,
                          appearance_from_color_scheme, detect_system_appearance)
 
 
+class TokensProxy:
+    def __init__(self, getter):
+        self._getter = getter
+
+    def __call__(self):
+        return self._getter()
+
+    def __getattr__(self, name):
+        return getattr(self._getter(), name)
+
+    def __eq__(self, other):
+        if isinstance(other, TokensProxy):
+            return self._getter() == other._getter()
+        return self._getter() == other
+
+    def __repr__(self):
+        return repr(self._getter())
+
+
 class ThemeManager(QObject):
     """Owns the ThemeController, persists preference changes, and restyles the QApplication.
 
@@ -30,7 +49,25 @@ class ThemeManager(QObject):
     def preference(self) -> ThemePreference:
         return self.controller.preference()
 
+    @property
     def tokens(self):
+        return TokensProxy(lambda: self.controller.active_tokens())
+
+    @property
+    def mode(self) -> str:
+        pref = self.controller.preference()
+        if pref is ThemePreference.SYSTEM:
+            return self.controller.system_appearance().value
+        return pref.value
+
+    @mode.setter
+    def mode(self, val: str):
+        self.set_preference(val)
+
+    def toggle(self):
+        current = self.mode
+        new_mode = "light" if current == "dark" else "dark"
+        self.set_preference(new_mode)
         return self.controller.active_tokens()
 
     def apply(self):
