@@ -13,7 +13,7 @@ def is_image(path) -> bool:
     return Path(path).suffix.lower() in IMAGE_EXTS
 
 
-def encode_image(img: QImage, name: str) -> dict:
+def encode_image(img: QImage, name: str, path: str | None = None) -> dict:
     if img.isNull():
         raise ValueError("not a readable image")
     if max(img.width(), img.height()) > MAX_SIDE:
@@ -29,11 +29,14 @@ def encode_image(img: QImage, name: str) -> dict:
     buf.open(QIODevice.OpenModeFlag.WriteOnly)
     flat.save(buf, "JPEG", 88)
     data = "data:image/jpeg;base64," + base64.b64encode(bytes(ba)).decode()
-    return dict(kind="image", name=name, chars=0, truncated=False, data=data, w=flat.width(), h=flat.height())
+    att = dict(kind="image", name=name, chars=0, truncated=False, data=data, w=flat.width(), h=flat.height())
+    if path:
+        att["path"] = str(path)
+    return att
 
 
 def load_image(path) -> dict:
-    return encode_image(QImage(str(path)), Path(path).name)
+    return encode_image(QImage(str(path)), Path(path).name, path=str(path))
 
 
 def decode_attachment_image(attachment) -> QImage:

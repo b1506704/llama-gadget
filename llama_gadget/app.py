@@ -1686,10 +1686,13 @@ class Gadget(QWidget):
         dialog.finished.connect(decided)
         dialog.open()
 
-    def _on_stats(self, n_ctx, speed):
-        self.ctx_used = n_ctx
+    def _on_stats(self, st):
+        self.ctx_used = st.get("total_tokens", self.ctx_used)
         self.ctx_exact = True
-        self.last_speed = speed
+        if "predicted_per_second" in st:
+            self.last_speed = (f"Gen: {st['predicted_per_second']:.1f} tok/s · "
+                               f"Prompt: {st.get('prompt_per_second', 0):.0f} tok/s · "
+                               f"Out: {st.get('completion_tokens', 0)} tok")
         self._update_stats()
 
     def _on_exchange(self, exchange):
@@ -1933,7 +1936,7 @@ class Gadget(QWidget):
         self.new_session()
         self.session_id = sid
         self.msgs = self.db.load_messages(sid)
-        self.ctx_used = sum(m.get("meta", {}).get("tokens", 0) for m in self.msgs)
+        self.ctx_used = sum(m.get("metadata", {}).get("tokens", 0) for m in self.msgs)
         if not self.ctx_used:
             self.ctx_used = sum(len(m["content"]) // 4 for m in self.msgs)
         self.ctx_exact = False
@@ -2013,8 +2016,11 @@ class Gadget(QWidget):
                 f"Switch to 'vision' in the header to attach images."
             )
             return
-        name = name or f"Pasted-Image-{datetime.now().strftime('%H%M%S')}.jpg"
-        att = encode_image(img, name=name, path=path)
+        if isinstance(img, dict):  # already encoded: attached file or drop on the input box
+            att = img
+        else:
+            name = name or f"Pasted-Image-{datetime.now().strftime('%H%M%S')}.jpg"
+            att = encode_image(img, name=name, path=path)
         self.attachments.append(att)
         self._update_attachments()
 
@@ -2090,7 +2096,7 @@ class Gadget(QWidget):
             it = menu.addAction("Clipboard history is empty")
             it.setEnabled(False)
         else:
-            for cid, text, ts in clips:
+            for text in clips:
                 first_line = text.splitlines()[0][:60]
                 label = f"{first_line}… ({len(text)} chars)" if len(text) > 60 else first_line
                 menu.addAction(label, lambda t=text: self.input.insertPlainText(t))
@@ -2197,7 +2203,14 @@ def main():
     app.setDesktopFileName("llama-gadget")
     w = Gadget()
     w.show()
-    sys.exit(app.exec())
+    rc = app.exec()
+    # Tear down in a fixed order while the QApplication still exists; leaving the
+    # widget to sip's interpreter-exit GC segfaults after the app is gone.
+    w.deleteLater()
+    del w
+    app.processEvents()
+    del app
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
