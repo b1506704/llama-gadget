@@ -20,166 +20,92 @@ def luminance(color):
     return 0.2126 * channel(q.red()) + 0.7152 * channel(q.green()) + 0.0722 * channel(q.blue())
 
 
-def _pseudo(selector, state):
-    """Apply a pseudo-state to every selector in a comma-separated group."""
-    return ', '.join(f'{part.strip()}:{state}' for part in selector.split(','))
-
-
-def _px(value):
-    return f'{value:g}px'
+def contrast_ratio(color1, color2):
+    """WCAG 2.1 contrast ratio between two colors: in range [1.0, 21.0]."""
+    l1 = luminance(color1)
+    l2 = luminance(color2)
+    lighter = max(l1, l2)
+    darker = min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
 
 
 class ThemeAdapter:
+    """Translates ThemeTokens into Qt QPalette, QFont, and stylesheet declarations."""
+
     def __init__(self, tokens: ThemeTokens):
         self.tokens = tokens
 
-    @property
-    def is_dark(self):
-        return luminance(self.tokens.colors.background) < 0.5
-
-    # -- color derivation -------------------------------------------------
-    def surface(self, tier='primary'):
-        if tier not in SURFACES:
-            raise ValueError(f'unknown surface tier {tier!r}')
-        c = self.tokens.colors
-        return c.background if tier == 'background' else getattr(c, f'surface_{tier}')
-
-    def text(self, role='primary'):
-        if role not in TEXT_ROLES:
-            raise ValueError(f'unknown text role {role!r}')
-        return getattr(self.tokens.colors, f'text_{role}')
-
-    def status_color(self, status):
-        if status not in STATUSES:
-            raise ValueError(f'unknown status {status!r}')
-        return getattr(self.tokens.colors, f'status_{status}')
-
-    def radius(self, size='md'):
-        if size not in RADII:
-            raise ValueError(f'unknown radius {size!r}')
-        return getattr(self.tokens.radii, size)
-
-    def hover(self, color):
-        """Interaction state: lighten on dark themes, darken on light ones."""
-        q = QColor(color)
-        return (q.lighter(128) if self.is_dark else q.darker(108)).name()
-
-    def on_color(self, color):
-        """Readable foreground for text drawn on top of `color`."""
-        c = self.tokens.colors
-        light, dark = sorted((c.text_primary, c.background), key=luminance, reverse=True)
-        return light if luminance(color) < ON_COLOR_THRESHOLD else dark
-
-    # -- native Qt objects ------------------------------------------------
     def palette(self) -> QPalette:
-        c, R, G = self.tokens.colors, QPalette.ColorRole, QPalette.ColorGroup
-        pal = QPalette()
-        for role, color in (
-                (R.Window, c.background), (R.WindowText, c.text_primary),
-                (R.Base, c.surface_primary), (R.AlternateBase, c.surface_elevated),
-                (R.Text, c.text_primary), (R.PlaceholderText, c.text_muted),
-                (R.Button, c.surface_elevated), (R.ButtonText, c.text_primary),
-                (R.BrightText, c.status_error), (R.Highlight, c.surface_overlay),
-                (R.HighlightedText, c.text_primary), (R.ToolTipBase, c.surface_overlay),
-                (R.ToolTipText, c.text_primary), (R.Link, c.status_info),
-                (R.LinkVisited, c.status_info), (R.Accent, c.accent),
-                (R.Light, self.hover(c.surface_elevated)), (R.Midlight, c.surface_elevated),
-                (R.Mid, c.border), (R.Dark, c.background), (R.Shadow, c.background)):
-            pal.setColor(role, QColor(color))
-        for role in (R.WindowText, R.Text, R.ButtonText):
-            pal.setColor(G.Disabled, role, QColor(c.text_muted))
-        return pal
+        p = QPalette()
+        c = self.tokens.colors
+        p.setColor(QPalette.ColorRole.Window, QColor(c.surface_background))
+        p.setColor(QPalette.ColorRole.WindowText, QColor(c.text_primary))
+        p.setColor(QPalette.ColorRole.Base, QColor(c.surface_primary))
+        p.setColor(QPalette.ColorRole.AlternateBase, QColor(c.surface_elevated))
+        p.setColor(QPalette.ColorRole.ToolTipBase, QColor(c.surface_overlay))
+        p.setColor(QPalette.ColorRole.ToolTipText, QColor(c.text_primary))
+        p.setColor(QPalette.ColorRole.Text, QColor(c.text_primary))
+        p.setColor(QPalette.ColorRole.Button, QColor(c.surface_elevated))
+        p.setColor(QPalette.ColorRole.ButtonText, QColor(c.text_primary))
+        p.setColor(QPalette.ColorRole.Highlight, QColor(c.accent))
+        p.setColor(QPalette.ColorRole.HighlightedText, QColor(self.on_color(c.accent)))
+        p.setColor(QPalette.ColorRole.PlaceholderText, QColor(c.text_muted))
+        p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(c.text_muted))
+        p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(c.text_muted))
+        p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(c.text_muted))
+        return p
 
-    def font(self, role='body') -> QFont:
-        token = self._type(role)
-        f = QFont()
-        f.setFamilies([part.strip().strip('"') for part in token.family.split(',')])
-        f.setPixelSize(token.size)
-        f.setWeight(QFont.Weight(token.weight))
+    def font(self, role: str = 'body') -> QFont:
+        t: TypeToken = getattr(self.tokens.typography, role)
+        f = QFont(t.font_family, int(t.font_size))
+        f.setWeight(QFont.Weight(t.font_weight))
         if role == 'monospace':
             f.setStyleHint(QFont.StyleHint.Monospace)
         return f
 
-    def _type(self, role) -> TypeToken:
-        if role not in TYPE_ROLES:
-            raise ValueError(f'unknown type role {role!r}')
-        return getattr(self.tokens.typography, role)
+    def on_color(self, fill_hex: str) -> str:
+        """Pick text_primary or background to guarantee WCAG AA on a given fill."""
+        return self.tokens.colors.background if luminance(fill_hex) > ON_COLOR_THRESHOLD else self.tokens.colors.text_primary
 
-    # -- QSS builders -----------------------------------------------------
-    def font_style(self, role='body'):
-        t = self._type(role)
-        return f'font-family: {t.family}; font-size: {t.size}px; font-weight: {t.weight};'
+    def meets_wcag_aa(self, fg: str, bg: str, large_text: bool = False) -> bool:
+        threshold = 3.0 if large_text else 4.5
+        return contrast_ratio(fg, bg) >= threshold
 
-    def text_style(self, role='primary', type_role='body'):
-        return f'color: {self.text(role)}; {self.font_style(type_role)}'
+    def highlight_color(self, alpha: float = 0.2) -> str:
+        q = QColor(self.tokens.colors.accent)
+        return f'rgba({q.red()}, {q.green()}, {q.blue()}, {alpha:.2f})'
 
-    def status_style(self, status, type_role='body'):
-        return f'color: {self.status_color(status)}; {self.font_style(type_role)}'
+    def stylesheet(self, scale: float = 1.0, base_pt: float = 10.0) -> str:
+        """Build the complete application stylesheet with token variables and component styles."""
+        t = self.tokens
+        c = t.colors
+        r = t.radii
+        f = self.font()
+        sel = self.highlight_color(0.2)
+        font_pt = int(f.pointSizeF() * scale) if f.pointSizeF() > 0 else int(base_pt * scale)
 
-    def status_badge_style(self, status):
-        color, s = self.status_color(status), self.tokens.spacing
-        return (f'background: {color}; color: {self.on_color(color)}; font-weight: 600; '
-                f'border-radius: {_px(self.radius("sm"))}; padding: 2px {s.xs}px; '
-                f'{self.font_style("caption")}')
-
-    def surface_style(self, tier='primary', selector=None, radius='md', bordered=True):
-        border = f'1px solid {self.tokens.colors.border}' if bordered else 'none'
-        body = (f'background: {self.surface(tier)}; border: {border}; '
-                f'border-radius: {_px(self.radius(radius))};')
-        return f'{selector} {{ {body} }}' if selector else body
-
-    def control_style(self, selector='QPushButton'):
-        c, s, r = self.tokens.colors, self.tokens.spacing, _px(self.tokens.radii.md)
-        return (
-            f'{selector} {{ background: {c.surface_elevated}; color: {c.text_primary}; '
-            f'border: 1px solid {c.surface_elevated}; border-radius: {r}; '
-            f'padding: {s.xxs}px {s.sm}px; }}\n'
-            f'{selector}:hover {{ background: {self.hover(c.surface_elevated)}; }}\n'
-            f'{selector}:focus {{ border: 1px solid {c.focus_ring}; }}\n'
-            f'{selector}:disabled {{ color: {c.text_muted}; }}')
-
-    def accent_control_style(self, selector='QPushButton'):
-        c, s, r = self.tokens.colors, self.tokens.spacing, _px(self.tokens.radii.sm)
-        return (
-            f'{selector} {{ background: {c.accent}; color: {self.on_color(c.accent)}; '
-            f'font-weight: 600; border: 1px solid {c.accent}; border-radius: {r}; '
-            f'padding: {s.xxs // 2}px {s.xs}px; }}\n'
-            f'{selector}:hover {{ background: {self.hover(c.accent)}; }}\n'
-            f'{selector}:focus {{ border: 1px solid {c.focus_ring}; }}')
-
-    def input_style(self, selector='QLineEdit'):
-        c, s, r = self.tokens.colors, self.tokens.spacing, _px(self.tokens.radii.md)
-        return (f'{selector} {{ background: {c.surface_primary}; color: {c.text_primary}; '
-                f'border: 1px solid {c.border}; border-radius: {r}; padding: {s.xxs}px; }}\n'
-                f'{_pseudo(selector, "focus")} {{ border: 1px solid {c.focus_ring}; }}')
-
-    def stylesheet(self):
-        """App-wide stylesheet: the token-driven equivalent of the original app STYLE."""
-        c, s, rad = self.tokens.colors, self.tokens.spacing, self.tokens.radii
-        md, lg, sel = _px(rad.md), _px(rad.lg), c.surface_overlay
-        inputs = 'QTextBrowser, QTextEdit, QPlainTextEdit, QLineEdit, QListWidget'
         return '\n'.join((
-            f'QWidget#root {{ background: {c.background}; border: 1px solid {c.border}; '
-            f'border-radius: {lg}; }}',
-            f'QDialog {{ background: {c.background}; }}',
-            f'QLabel, QCheckBox {{ color: {c.text_secondary}; }}',
-            self.input_style(inputs),
-            f'QComboBox {{ background: {c.surface_primary}; color: {c.text_primary}; '
-            f'border: 1px solid {c.border}; border-radius: {md}; padding: {s.xxs}px {s.xs}px; }}',
-            f'QComboBox:focus {{ border: 1px solid {c.focus_ring}; }}',
-            f'QComboBox QAbstractItemView {{ background: {c.surface_primary}; '
-            f'color: {c.text_primary}; selection-background-color: {sel}; }}',
-            f'QListWidget::item {{ padding: {s.xxs}px; border-bottom: 1px solid {c.border}; }}',
-            f'QListWidget::item:selected {{ background: {sel}; color: {c.text_primary}; }}',
-            self.control_style('QPushButton'),
-            'QTabWidget::pane { border: none; }',
-            f'QTabBar::tab {{ background: {c.surface_primary}; color: {c.text_muted}; '
-            f'padding: {s.xxs}px {s.sm}px; border-radius: {md}; margin-right: {s.xxs}px; }}',
-            f'QTabBar::tab:selected {{ background: {sel}; color: {c.text_primary}; }}',
-            f'QTabBar::tab:focus {{ border: 1px solid {c.focus_ring}; }}',
-            f'QMenu {{ background: {c.surface_primary}; color: {c.text_primary}; '
+            f'QWidget {{ font-family: "{f.family()}"; font-size: {font_pt}pt; }}',
+            f'*[keyboardFocus="true"] {{ border: 2px solid {c.focus_ring}; outline: none; }}',
+            f'QMainWindow, QDialog {{ background: {c.surface_background}; color: {c.text_primary}; }}',
+            f'QSplitter::handle {{ background: {c.border}; }}',
+            f'QLineEdit, QTextEdit, QPlainTextEdit {{ background: {c.surface_primary}; color: {c.text_primary}; '
+            f'border: 1px solid {c.border}; border-radius: {r.md}px; padding: 4px; }}',
+            f'QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {{ border-color: {c.focus_ring}; }}',
+            f'QPushButton {{ background: {c.surface_elevated}; color: {c.text_primary}; '
+            f'border: 1px solid {c.border}; border-radius: {r.md}px; padding: 4px 12px; }}',
+            f'QPushButton:hover {{ background: {self.highlight_color(0.15)}; }}',
+            f'QPushButton:pressed {{ background: {self.highlight_color(0.25)}; }}',
+            f'QScrollBar:vertical {{ background: {c.surface_background}; width: 10px; margin: 0; }}',
+            f'QScrollBar::handle:vertical {{ background: {c.border}; min-height: 20px; border-radius: {r.sm}px; }}',
+            f'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}',
+            f'QMenu {{ background: {c.surface_overlay}; color: {c.text_primary}; '
             f'border: 1px solid {c.border}; }}',
             f'QMenu::item:selected {{ background: {sel}; }}',
             f'QToolTip {{ background: {c.surface_overlay}; color: {c.text_primary}; '
             f'border: 1px solid {c.border}; }}',
         )) + '\n'
+
+    def app_stylesheet(self, scale: float = 1.0, base_pt: float = 10.0) -> str:
+        """Alias for stylesheet() to maintain backward compatibility."""
+        return self.stylesheet(scale=scale, base_pt=base_pt)

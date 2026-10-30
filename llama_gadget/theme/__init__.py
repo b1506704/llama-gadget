@@ -8,29 +8,33 @@ from .controller import (SystemAppearance, ThemeController, ThemePreference,
 from .store import (JsonThemePreferenceStore, ThemePersistError, ThemePreferenceStore,
                     default_preferences_path)
 from .runtime import ThemeManager
-from .current import (active_adapter, active_tokens, bind_theme, default_preferences_path,
-                      set_active_adapter, theme_hub)
+from .current import (active_adapter, active_tokens, bind_theme, set_active_adapter, theme_hub)
 
 DARK = DARK_TOKENS
 LIGHT = LIGHT_TOKENS
 
 
-def stylesheet(tokens=None):
-    from .adapter import ThemeAdapter
+def stylesheet(tokens=None, scale=1.0, base_pt=10.0):
+    """Return the application stylesheet for the given tokens (or current active theme)."""
     toks = tokens or active_tokens()
-    return ThemeAdapter(toks).app_stylesheet()
+    adapter = ThemeAdapter(toks)
+    if hasattr(adapter, 'stylesheet'):
+        return adapter.stylesheet(scale=scale, base_pt=base_pt)
+    return adapter.app_stylesheet(scale=scale, base_pt=base_pt)
 
 
 def toggle():
-    hub = theme_hub()
-    if hub is not None:
-        hub.toggle()
+    """Toggle between light and dark themes using the runtime theme manager."""
+    mgr = ThemeManager()
+    mgr.toggle()
+    return mgr.current_tokens
 
 
-__all__ = ['Color', 'CornerRadii', 'DARK_TOKENS', 'JsonThemePreferenceStore', 'LIGHT_TOKENS',
-           'SemanticColors', 'SpacingScale', 'SystemAppearance', 'ThemeAdapter', 'ThemeController',
-           'ThemeManager', 'ThemePersistError', 'ThemePreference', 'ThemePreferenceStore',
-           'ThemeTokens', 'TypeToken', 'TypographyScale', 'appearance_from_color_scheme',
+__all__ = ['Color', 'CornerRadii', 'DEFAULT_RADII', 'DEFAULT_SPACING', 'DEFAULT_TYPOGRAPHY',
+           'DARK_TOKENS', 'LIGHT_TOKENS', 'JsonThemePreferenceStore', 'SemanticColors',
+           'SpacingScale', 'SystemAppearance', 'ThemeAdapter', 'ThemeController',
+           'ThemeManager', 'ThemePersistError', 'ThemePreference', 'ThemePreferenceStore', 'ThemeTokens',
+           'TypeToken', 'TypographyScale', 'appearance_from_color_scheme',
            'active_adapter', 'active_tokens', 'bind_theme', 'default_preferences_path',
            'detect_system_appearance', 'set_active_adapter', 'theme_hub',
            'DARK', 'LIGHT', 'stylesheet', 'toggle']
